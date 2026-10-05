@@ -5,7 +5,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from x17_registry.application.polling import SourceRecord
 
@@ -91,52 +91,86 @@ class RegistryStore:
             return sum(self._save(connection, record, processed) for record, processed in records)
 
     def save_detector_batch(self, records: Iterable[SourceRecord]) -> int:
-        saved = 0
         with closing(self.connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            for record in records:
-                if (
-                    record.source != "influx"
-                    or record.event_time is None
-                    or record.run_number is None
-                ):
-                    raise ValueError("Detector batch requires complete Influx points.")
-                point_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
-                existing = connection.execute(
+            return self._save_detector_batch(connection, records)
+
+    def save_detector_backfill_batch(
+        self, records: Iterable[SourceRecord], synchronous: Literal["FULL", "NORMAL", "OFF"]
+    ) -> int:
+        if synchronous not in ("FULL", "NORMAL", "OFF"):
+            raise ValueError("Unsupported SQLite synchronous mode.")
+        with closing(self.connect()) as connection:
+            connection.execute(f"PRAGMA synchronous={synchronous}")
+            connection.execute("PRAGMA temp_store=MEMORY")
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                return self._save_detector_batch(connection, records)
+
+    def _save_detector_batch(
+        self, connection: sqlite3.Connection, records: Iterable[SourceRecord]
+    ) -> int:
+        batch = list(records)
+        times = [record.event_time for record in batch if record.event_time is not None]
+        has_legacy = bool(
+            times
+            and connection.execute(
+                "SELECT 1 FROM collected_records WHERE source='influx' "
+                "AND event_time>=? AND event_time<=? LIMIT 1",
+                (min(times), max(times)),
+            ).fetchone()
+        )
+        saved = 0
+        for record in batch:
+            if record.source != "influx" or record.event_time is None or record.run_number is None:
+                raise ValueError("Detector batch requires complete Influx points.")
+            point_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
+            existing = (
+                connection.execute(
                     "SELECT raw_json FROM collected_records WHERE source='influx' "
                     "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
                     (record.source_instance, record.source_id),
                 ).fetchone()
-                if existing is not None and existing["raw_json"] == point_json:
-                    continue
-                previous_point = connection.execute(
-                    "SELECT 1 FROM detector_points WHERE source_instance=? AND source_id=?",
-                    (record.source_instance, record.source_id),
-                ).fetchone()
-                cursor = connection.execute(
-                    "INSERT INTO detector_points "
-                    "(source_instance,source_id,event_time,run_number,point_json) "
-                    "VALUES(?,?,?,?,?) ON CONFLICT(source_instance,source_id) DO UPDATE SET "
-                    "event_time=excluded.event_time,run_number=excluded.run_number,"
-                    "point_json=excluded.point_json WHERE point_json<>excluded.point_json",
+                if has_legacy
+                else None
+            )
+            if existing is not None and existing["raw_json"] == point_json:
+                continue
+            inserted = connection.execute(
+                "INSERT INTO detector_points "
+                "(source_instance,source_id,event_time,run_number,point_json) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(source_instance,source_id) DO NOTHING",
+                (
+                    record.source_instance,
+                    record.source_id,
+                    record.event_time,
+                    record.run_number,
+                    point_json,
+                ),
+            ).rowcount
+            saved += inserted
+            if inserted and existing is None:
+                connection.execute(
+                    "INSERT INTO run_summaries "
+                    "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
+                    "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
+                    "started_at=MIN(started_at,excluded.started_at), "
+                    "point_count=point_count+1",
+                    (record.source_instance, record.run_number, record.event_time),
+                )
+            if not inserted:
+                saved += connection.execute(
+                    "UPDATE detector_points SET event_time=?,run_number=?,point_json=? "
+                    "WHERE source_instance=? AND source_id=? AND point_json<>?",
                     (
-                        record.source_instance,
-                        record.source_id,
                         record.event_time,
                         record.run_number,
                         point_json,
+                        record.source_instance,
+                        record.source_id,
+                        point_json,
                     ),
-                )
-                saved += cursor.rowcount
-                if cursor.rowcount and existing is None and previous_point is None:
-                    connection.execute(
-                        "INSERT INTO run_summaries "
-                        "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
-                        "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
-                        "started_at=MIN(started_at,excluded.started_at), "
-                        "point_count=point_count+1",
-                        (record.source_instance, record.run_number, record.event_time),
-                    )
+                ).rowcount
         return saved
 
     def _save(

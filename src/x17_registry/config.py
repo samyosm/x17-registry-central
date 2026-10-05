@@ -93,3 +93,6 @@ class PollSettings(CommonSettings):
 class BackfillSettings(PollSettings):
     influx_backfill_min_window_seconds: float = Field(gt=0)
     influx_backfill_progress_seconds: float = Field(gt=0)
+    influx_backfill_pending_batches: int = Field(gt=0)
+    influx_backfill_runs_only: bool
+    influx_backfill_sqlite_synchronous: Literal["FULL", "NORMAL", "OFF"]

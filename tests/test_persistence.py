@@ -138,6 +138,52 @@ def test_detector_batch_rolls_back_on_invalid_point(store):
     assert list(store.iter_detector_points("2026-09-27T14:00:00Z", None)) == []
 
 
+def test_backfill_uses_wal_and_connection_local_sqlite_pragmas(monkeypatch, store):
+    statements = []
+    connect = store.connect
+
+    def traced_connect():
+        connection = connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "connect", traced_connect)
+    point = SourceRecord(
+        "influx", "test-influx", "point-1", {"_value": "312"}, "2026-09-27T14:00:00Z", "80"
+    )
+    assert store.save_detector_backfill_batch([point], "NORMAL") == 1
+    assert "PRAGMA synchronous=NORMAL" in statements
+    assert "PRAGMA temp_store=MEMORY" in statements
+    with connect() as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    with pytest.raises(ValueError, match="Unsupported SQLite"):
+        store.save_detector_backfill_batch([point], "invalid")
+
+
+def test_new_detector_time_range_skips_per_point_legacy_lookups(monkeypatch, store):
+    old = SourceRecord(
+        "influx", "test-influx", "old", {"_value": "1"}, "2026-09-01T00:00:00Z", "80"
+    )
+    store.save(old, dict(old.raw))
+    statements = []
+    connect = store.connect
+
+    def traced_connect():
+        connection = connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "connect", traced_connect)
+    new = SourceRecord(
+        "influx", "test-influx", "new", {"_value": "2"}, "2026-10-05T00:00:00Z", "80"
+    )
+    assert store.save_detector_backfill_batch([new], "NORMAL") == 1
+    assert any("SELECT 1 FROM collected_records" in statement for statement in statements)
+    assert not any(
+        "SELECT raw_json FROM collected_records" in statement for statement in statements
+    )
+
+
 def test_source_failure_does_not_block_other_sources(store):
     class BrokenReader:
         def read(self, checkpoint, now):

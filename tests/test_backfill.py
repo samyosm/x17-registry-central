@@ -10,6 +10,7 @@ from conftest import poll_settings
 from x17_registry.adapters.readers import InfluxReader
 from x17_registry.application.backfill import backfill_influx
 from x17_registry.application.polling import SeekableInfluxReader, SourceRecord
+from x17_registry.config import BackfillSettings
 
 
 class SparseReader(SeekableInfluxReader):
@@ -51,8 +52,8 @@ class TruncatedReader(SparseReader):
         yield from records
 
 
-def settings_for(store, start):
-    return poll_settings(
+def settings_for(store, start, **overrides):
+    settings = poll_settings(
         store.path,
         influx_enabled=True,
         influx_url="http://example.invalid:8086",
@@ -64,6 +65,16 @@ def settings_for(store, start):
         influx_window_seconds=300,
         influx_overlap_seconds=60,
     )
+    values = {
+        **settings.model_dump(),
+        "influx_backfill_min_window_seconds": 1,
+        "influx_backfill_progress_seconds": 10,
+        "influx_backfill_pending_batches": 2,
+        "influx_backfill_runs_only": False,
+        "influx_backfill_sqlite_synchronous": "NORMAL",
+    }
+    values.update(overrides)
+    return BackfillSettings(_env_file=None, **values)
 
 
 def test_reverse_backfill_starts_newest_and_skips_empty_years(store):
@@ -73,7 +84,7 @@ def test_reverse_backfill_starts_newest_and_skips_empty_years(store):
     reader = SparseReader([older, newer])
     updates = []
 
-    result = backfill_influx(reader, store, settings_for(store, start), 1, 10, 2, updates.append)
+    result = backfill_influx(reader, store, settings_for(store, start), updates.append)
 
     assert result["skipped_gaps"] == 2
     assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
@@ -96,9 +107,7 @@ def test_reverse_backfill_retries_truncated_stream_without_duplicates(store):
     events = [start + timedelta(seconds=1), start + timedelta(seconds=200)]
     updates = []
 
-    backfill_influx(
-        TruncatedReader(events), store, settings_for(store, start), 1, 10, 2, updates.append
-    )
+    backfill_influx(TruncatedReader(events), store, settings_for(store, start), updates.append)
 
     assert any(update["event"] == "retry_smaller_window" for update in updates)
     assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
@@ -111,14 +120,45 @@ def test_reverse_backfill_resumes_after_failure(store):
     settings = settings_for(store, start)
 
     with pytest.raises(RuntimeError, match="reverse checkpoint remains"):
-        backfill_influx(TruncatedReader([event]), store, settings, 300, 10, 2, lambda _: None)
+        backfill_influx(
+            TruncatedReader([event]),
+            store,
+            settings.model_copy(update={"influx_backfill_min_window_seconds": 300}),
+            lambda _: None,
+        )
     upper = store.checkpoint("influx-backfill-upper:test-influx")
     cursor = store.checkpoint("influx-backfill-reverse:test-influx")
     assert upper == cursor
 
-    backfill_influx(SparseReader([event]), store, settings, 1, 10, 2, lambda _: None)
+    backfill_influx(SparseReader([event]), store, settings, lambda _: None)
     assert store.checkpoint("influx-backfill-upper:test-influx") == upper
     assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 1
+
+
+def test_committed_writer_batch_is_deduplicated_after_stream_retry(store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    event = datetime.now(UTC) - timedelta(seconds=30)
+    settings = settings_for(
+        store,
+        start,
+        influx_backfill_batch_size=1,
+        influx_backfill_min_window_seconds=300,
+    )
+
+    with pytest.raises(RuntimeError, match="reverse checkpoint remains"):
+        backfill_influx(TruncatedReader([event]), store, settings, lambda _: None)
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 1
+    checkpoint = store.checkpoint("influx-backfill-reverse:test-influx")
+    assert checkpoint is not None
+    assert datetime.fromisoformat(checkpoint) > event
+
+    backfill_influx(
+        SparseReader([event]),
+        store,
+        settings.model_copy(update={"influx_backfill_min_window_seconds": 1}),
+        lambda _: None,
+    )
     assert len(list(store.iter_detector_points(start.isoformat(), None))) == 1
 
 
@@ -137,14 +177,19 @@ def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
             assert update["phase_seconds"] >= 0
             heartbeat_seen.set()
 
-    backfill_influx(WaitingReader([]), store, settings_for(store, start), 1, 0.01, 2, progress)
+    backfill_influx(
+        WaitingReader([]),
+        store,
+        settings_for(store, start, influx_backfill_progress_seconds=0.01),
+        progress,
+    )
     assert heartbeat_seen.is_set()
 
 
 def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
     start = datetime.now(UTC) - timedelta(minutes=10)
     event = start + timedelta(seconds=200)
-    save = store.save_detector_batch
+    save = store.save_detector_backfill_batch
     updates = []
 
     class SlowReader(SparseReader):
@@ -153,13 +198,16 @@ def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
                 sleep(0.02)
                 yield record
 
-    def slow_save(records):
+    def slow_save(records, synchronous):
         sleep(0.02)
-        return save(records)
+        return save(records, synchronous)
 
-    monkeypatch.setattr(store, "save_detector_batch", slow_save)
+    monkeypatch.setattr(store, "save_detector_backfill_batch", slow_save)
     backfill_influx(
-        SlowReader([event]), store, settings_for(store, start), 1, 10, 1, updates.append
+        SlowReader([event]),
+        store,
+        settings_for(store, start, influx_backfill_batch_size=1),
+        updates.append,
     )
 
     completed = next(
@@ -169,6 +217,79 @@ def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
     )
     assert completed["sqlite_seconds"] >= 0.02
     assert completed["influx_seconds"] >= 0.02
+
+
+def test_run_limited_backfill_skips_points_before_trigger_history(store):
+    first_run = datetime.now(UTC) - timedelta(days=1)
+    old_point = first_run - timedelta(days=30)
+    recent_point = first_run + timedelta(seconds=1)
+    store.save(
+        SourceRecord(
+            "trigger_history", "test-trigger", "first", {"id": "first"}, first_run.isoformat()
+        ),
+        {"id": "first"},
+    )
+    reader = SparseReader([old_point, recent_point])
+    updates = []
+    settings = settings_for(store, old_point - timedelta(days=1), influx_backfill_runs_only=True)
+
+    backfill_influx(reader, store, settings, updates.append)
+
+    assert updates[0]["oldest_needed"] == first_run.isoformat()
+    assert all(window_start >= first_run for window_start, _ in reader.windows)
+    assert len(list(store.iter_detector_points(first_run.isoformat(), None))) == 1
+
+
+def test_run_limited_backfill_requires_trigger_history(store):
+    settings = settings_for(
+        store, datetime.now(UTC) - timedelta(days=2), influx_backfill_runs_only=True
+    )
+    with pytest.raises(ValueError, match="TriggerApp runs must be imported"):
+        backfill_influx(SparseReader([]), store, settings, lambda _: None)
+
+
+def test_reader_and_writer_overlap_without_unbounded_queue(monkeypatch, store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    events = [start + timedelta(seconds=200), start + timedelta(seconds=201)]
+    writer_started = Event()
+    save = store.save_detector_backfill_batch
+
+    class OverlapReader(SparseReader):
+        def read_window(self, start, stop):
+            for index, record in enumerate(super().read_window(start, stop)):
+                if index:
+                    assert writer_started.wait(1)
+                yield record
+
+    def tracked_save(records, synchronous):
+        writer_started.set()
+        return save(records, synchronous)
+
+    monkeypatch.setattr(store, "save_detector_backfill_batch", tracked_save)
+    settings = settings_for(
+        store, start, influx_backfill_batch_size=1, influx_backfill_pending_batches=2
+    )
+    backfill_influx(OverlapReader(events), store, settings, lambda _: None)
+
+    assert writer_started.is_set()
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
+
+
+def test_writer_failure_keeps_reverse_checkpoint(monkeypatch, store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    event = datetime.now(UTC) - timedelta(seconds=30)
+    settings = settings_for(store, start, influx_backfill_batch_size=1)
+
+    def broken_save(records, synchronous):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(store, "save_detector_backfill_batch", broken_save)
+    with pytest.raises(RuntimeError, match="SQLite backfill batch failed"):
+        backfill_influx(SparseReader([event]), store, settings, lambda _: None)
+
+    assert store.checkpoint("influx-backfill-reverse:test-influx") == store.checkpoint(
+        "influx-backfill-upper:test-influx"
+    )
 
 
 def test_previous_point_query_uses_last_and_max(monkeypatch, store):

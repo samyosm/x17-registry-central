@@ -1,4 +1,6 @@
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from http.client import IncompleteRead, RemoteDisconnected
 from threading import Event, Lock, Thread
@@ -6,7 +8,7 @@ from time import monotonic
 
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.polling import SeekableInfluxReader, SourceRecord
-from x17_registry.config import PollSettings
+from x17_registry.config import BackfillSettings
 
 STREAM_FAILURES = (IncompleteRead, RemoteDisconnected, ConnectionResetError, TimeoutError)
 
@@ -30,25 +32,26 @@ def _progress_percent(lower: datetime, upper: datetime, cursor: datetime) -> flo
 def backfill_influx(
     reader: SeekableInfluxReader,
     store: RegistryStore,
-    settings: PollSettings,
-    min_window_seconds: float,
-    progress_seconds: float,
-    batch_size: int,
+    settings: BackfillSettings,
     progress: Callable[[dict[str, object]], None],
 ) -> dict[str, int | str]:
     if settings.influx_start_at is None or settings.influx_source_instance is None:
         raise ValueError("InfluxDB start time and source instance are required for backfill.")
-    if min_window_seconds <= 0 or min_window_seconds > settings.influx_window_seconds:
+    if settings.influx_backfill_min_window_seconds > settings.influx_window_seconds:
         raise ValueError("Backfill minimum window must be positive and at most the query window.")
-    if progress_seconds <= 0:
-        raise ValueError("Backfill progress interval must be positive.")
-    if batch_size <= 0:
-        raise ValueError("Backfill batch size must be positive.")
 
-    lower = settings.influx_start_at.astimezone(UTC)
+    requested_lower = settings.influx_start_at.astimezone(UTC)
+    lower = requested_lower
+    if settings.influx_backfill_runs_only:
+        runs = store.trigger_runs()
+        if not runs:
+            raise ValueError("TriggerApp runs must be imported before run-limited backfill.")
+        lower = max(requested_lower, min(_time(run["event_time"]) for run in runs))
     cursor_key, upper_key = _checkpoint_keys(settings.influx_source_instance)
     saved_upper = store.checkpoint(upper_key)
     upper = _time(saved_upper) if saved_upper is not None else datetime.now(UTC)
+    if lower > upper:
+        raise ValueError("The earliest TriggerApp run starts after the backfill upper bound.")
     if saved_upper is None:
         store.set_checkpoint(upper_key, upper.isoformat())
     saved_cursor = store.checkpoint(cursor_key)
@@ -67,6 +70,8 @@ def backfill_influx(
         "window_records": 0,
         "records_read": 0,
         "records_saved": 0,
+        "pending_batches": 0,
+        "write_batches": 0,
         "phase": "starting",
     }
 
@@ -91,7 +96,7 @@ def backfill_influx(
         phase_started = monotonic()
 
     def heartbeat() -> None:
-        while not stopped.wait(progress_seconds):
+        while not stopped.wait(settings.influx_backfill_progress_seconds):
             report("heartbeat")
 
     monitor = Thread(target=heartbeat, daemon=True)
@@ -101,20 +106,54 @@ def backfill_influx(
     skipped = 0
     records_read = 0
     records_saved = 0
+    write_batches = 0
+    writer = ThreadPoolExecutor(max_workers=1)
+    pending: deque[Future[tuple[int, float]]] = deque()
 
-    def flush(batch: list[SourceRecord]) -> None:
+    def write_batch(batch: list[SourceRecord]) -> tuple[int, float]:
+        began = monotonic()
+        saved = store.save_detector_backfill_batch(
+            batch, settings.influx_backfill_sqlite_synchronous
+        )
+        return saved, monotonic() - began
+
+    def collect_one() -> None:
         nonlocal records_saved
-        if batch:
-            phase("sqlite_write")
-            write_started = monotonic()
-            records_saved += store.save_detector_batch(batch)
-            timings["sqlite"] += monotonic() - write_started
-            state["records_saved"] = records_saved
-            batch.clear()
-            phase("reading_influx")
+        phase("waiting_sqlite")
+        try:
+            saved, elapsed = pending.popleft().result()
+        except Exception as error:
+            raise RuntimeError(
+                "SQLite backfill batch failed; checkpoint was not advanced."
+            ) from error
+        records_saved += saved
+        timings["sqlite"] += elapsed
+        state["records_saved"] = records_saved
+        state["pending_batches"] = len(pending)
+        phase("reading_influx")
+
+    def submit(batch: list[SourceRecord]) -> None:
+        nonlocal write_batches
+        if not batch:
+            return
+        pending.append(writer.submit(write_batch, batch))
+        state["pending_batches"] = len(pending)
+        write_batches += 1
+        state["write_batches"] = write_batches
+        if len(pending) >= settings.influx_backfill_pending_batches:
+            collect_one()
+
+    def drain() -> None:
+        while pending:
+            collect_one()
 
     try:
-        report("started", oldest_requested=lower.isoformat(), newest=upper.isoformat())
+        report(
+            "started",
+            oldest_requested=requested_lower.isoformat(),
+            oldest_needed=lower.isoformat(),
+            newest=upper.isoformat(),
+        )
         while cursor > lower:
             start = max(cursor - timedelta(seconds=window_seconds), lower)
             state.update(
@@ -122,9 +161,11 @@ def backfill_influx(
                 window_end=cursor.isoformat(),
                 window_records=0,
                 window_seconds=window_seconds,
+                write_batches=0,
             )
             timings["influx"] = 0.0
             timings["sqlite"] = 0.0
+            write_batches = 0
             phase("window_start")
             report("window_started")
             count = 0
@@ -146,17 +187,23 @@ def backfill_influx(
                     records_read += 1
                     state["window_records"] = count
                     state["records_read"] = records_read
-                    if len(batch) >= batch_size:
-                        flush(batch)
-                flush(batch)
+                    if len(batch) >= settings.influx_backfill_batch_size:
+                        submit(batch)
+                        batch = []
+                submit(batch)
+                drain()
             except STREAM_FAILURES as error:
-                if window_seconds <= min_window_seconds:
+                drain()
+                if window_seconds <= settings.influx_backfill_min_window_seconds:
                     raise RuntimeError(
                         f"InfluxDB stream failed at the minimum backfill window "
-                        f"({min_window_seconds:g}s); reverse checkpoint remains "
+                        f"({settings.influx_backfill_min_window_seconds:g}s); "
+                        "reverse checkpoint remains "
                         f"{cursor.isoformat()}."
                     ) from error
-                window_seconds = max(window_seconds / 2, min_window_seconds)
+                window_seconds = max(
+                    window_seconds / 2, settings.influx_backfill_min_window_seconds
+                )
                 report("retry_smaller_window", next_window_seconds=window_seconds)
                 continue
 
@@ -211,5 +258,6 @@ def backfill_influx(
             "checkpoint": cursor.isoformat(),
         }
     finally:
+        writer.shutdown(wait=True)
         stopped.set()
         monitor.join()
