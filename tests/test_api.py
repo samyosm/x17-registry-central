@@ -51,8 +51,10 @@ def test_interface_run_routes_and_download(client, store):
     assert found["title"] == "Cosmic calibration"
     assert found["beamStatus"] == "unknown"
     assert found["experimentId"] == "unknown"
-    assert found["pointCount"] == 1
-    assert found["estimatedJsonBytes"] > 0
+    assert found["pointCount"] is None
+    stats = client.get(f"/api/v1/runs/stats?ids={found['id']}").json()["stats"][found["id"]]
+    assert stats["pointCount"] == 1
+    assert stats["estimatedJsonBytes"] > 0
     detail = client.get(f"/api/v1/runs/{found['id']}")
     assert detail.status_code == 200
     body = detail.json()
@@ -89,6 +91,36 @@ def test_interface_run_routes_and_download(client, store):
     assert client.get("/api/v1/runs?q=absent").json()["runs"] == []
     assert client.get("/api/v1/runs/unknown").status_code == 404
     assert client.get("/api/v1/runs?from=2026-09-30&to=2026-09-01").status_code == 400
+
+
+def test_run_list_checks_detector_only_for_visible_rows(client, store, monkeypatch):
+    for day in range(1, 21):
+        at = f"2026-09-{day:02d}T14:00:00Z"
+        store.save(
+            SourceRecord(
+                "trigger_history",
+                "test-trigger",
+                str(day),
+                {"title": f"Run {day}"},
+                at,
+            ),
+            {},
+        )
+    checked = []
+
+    def origin(start, end):
+        checked.append(start)
+        return None
+
+    def expensive_count(start, end):
+        raise AssertionError("The run list must not count detector rows")
+
+    monkeypatch.setattr(store, "influx_origin", origin)
+    monkeypatch.setattr(store, "detector_window_stats", expensive_count)
+    response = client.get("/api/v1/runs?pageSize=5")
+    assert response.status_code == 200
+    assert response.json()["total"] == 20
+    assert len(checked) == 5
 
 
 def test_records_and_authentication(client, store):
