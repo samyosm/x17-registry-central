@@ -67,6 +67,7 @@ class PollJob:
         records, checkpoint = self.readers[name].read(self.store.checkpoint(name), now)
         count = 0
         detector_batch: list[SourceRecord] = []
+        source_batch: list[tuple[SourceRecord, dict[str, Any]]] = []
         for record in records:
             if record.source == "influx":
                 detector_batch.append(record)
@@ -74,10 +75,12 @@ class PollJob:
                     self.store.save_detector_batch(detector_batch)
                     detector_batch.clear()
             else:
-                self.store.save(record, self.processor.process(record))
+                source_batch.append((record, self.processor.process(record)))
             count += 1
         if detector_batch:
             self.store.save_detector_batch(detector_batch)
+        if source_batch:
+            self.store.save_batch(source_batch)
         if checkpoint is not None:
             self.store.set_checkpoint(name, checkpoint)
         self.store.mark_synced(name, datetime.now(UTC))

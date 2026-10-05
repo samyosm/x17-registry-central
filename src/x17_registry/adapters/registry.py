@@ -1,502 +1,297 @@
 import hashlib
 import json
-import sqlite3
+import re
+import time
+from calendar import timegm
 from collections.abc import Iterable, Iterator
-from contextlib import closing
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
+from x17_registry.adapters.clickhouse import ClickHouseClient
 from x17_registry.application.polling import SourceRecord
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS collected_records (
-    id INTEGER PRIMARY KEY,
-    source TEXT NOT NULL,
-    source_instance TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    content_hash TEXT NOT NULL,
-    event_time TEXT,
-    run_number TEXT,
-    raw_json TEXT NOT NULL,
-    processed_json TEXT NOT NULL,
-    collected_at TEXT NOT NULL,
-    UNIQUE(source, source_instance, source_id, revision)
-);
-CREATE INDEX IF NOT EXISTS collected_source
-ON collected_records(source, source_instance, source_id, revision);
-CREATE INDEX IF NOT EXISTS collected_run ON collected_records(source, run_number, event_time);
-CREATE INDEX IF NOT EXISTS collected_event_time ON collected_records(source, event_time);
-CREATE TABLE IF NOT EXISTS poll_checkpoints (
-    source TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS source_sync (
-    source TEXT PRIMARY KEY,
-    last_success_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS run_summaries (
-    source_instance TEXT NOT NULL,
-    run_number TEXT NOT NULL,
-    started_at TEXT,
-    point_count INTEGER NOT NULL,
-    PRIMARY KEY (source_instance, run_number)
-);
-CREATE TABLE IF NOT EXISTS detector_points (
-    source_instance TEXT NOT NULL,
-    source_id TEXT NOT NULL,
-    event_time TEXT NOT NULL,
-    run_number TEXT NOT NULL,
-    point_json TEXT NOT NULL,
-    PRIMARY KEY (source_instance, source_id)
-);
-CREATE INDEX IF NOT EXISTS detector_point_time ON detector_points(event_time);
-CREATE INDEX IF NOT EXISTS detector_point_run
-ON detector_points(source_instance, run_number, event_time);
-"""
 
-LATEST = """
-SELECT r.* FROM collected_records r
-JOIN (
-    SELECT source, source_instance, source_id, MAX(revision) AS revision
-    FROM collected_records GROUP BY source, source_instance, source_id
-) latest
-ON r.source=latest.source AND r.source_instance=latest.source_instance
-AND r.source_id=latest.source_id AND r.revision=latest.revision
-"""
+def epoch_ns(value: str) -> int:
+    text = value.replace("Z", "+00:00")
+    moment = datetime.fromisoformat(text).astimezone(UTC)
+    seconds = timegm(moment.utctimetuple())
+    match = re.search(r"\.(\d+)", text)
+    fraction = match.group(1)[:9] if match else ""
+    return seconds * 1_000_000_000 + int(fraction.ljust(9, "0") or "0")
+
+
+def record_id(source: str, instance: str, identity: str, revision: int) -> int:
+    key = json.dumps([source, instance, identity, revision], separators=(",", ":"))
+    return int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") & ((1 << 53) - 1)
+
+
+def latest_records(source: str | None = None) -> str:
+    condition = "WHERE source={source:String}" if source else ""
+    return (
+        "SELECT * FROM collected_records FINAL "
+        f"{condition} ORDER BY source,source_instance,source_id,revision DESC "
+        "LIMIT 1 BY source,source_instance,source_id"
+    )
+
+
+SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS collected_records (
+        id UInt64, source LowCardinality(String), source_instance String, source_id String,
+        revision UInt32, content_hash String, event_time Nullable(String),
+        event_ns Nullable(Int64), run_number Nullable(String), raw_json String,
+        processed_json String, collected_at String, version UInt64
+    ) ENGINE = ReplacingMergeTree(version)
+    ORDER BY (source,source_instance,source_id,revision)""",
+    """CREATE TABLE IF NOT EXISTS detector_points (
+        source_instance String, source_id String, event_ns Int64,
+        event_time String, run_number String, point_json String, version UInt64
+    ) ENGINE = ReplacingMergeTree(version)
+    ORDER BY (event_ns,source_instance,source_id)""",
+    """CREATE TABLE IF NOT EXISTS registry_state (
+        kind LowCardinality(String), source String, value String, version UInt64
+    ) ENGINE = ReplacingMergeTree(version) ORDER BY (kind,source)""",
+)
 
 
 class RegistryStore:
-    def __init__(self, path: Path, timeout_seconds: float) -> None:
-        self.path = path
-        self.timeout_seconds = timeout_seconds
-
-    def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=self.timeout_seconds)
-        connection.row_factory = sqlite3.Row
-        return connection
+    def __init__(self, client: ClickHouseClient) -> None:
+        self.client = client
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(self.connect()) as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.executescript(SCHEMA)
-            connection.commit()
-
-    def save(self, record: SourceRecord, processed: dict[str, Any]) -> bool:
-        with closing(self.connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            return self._save(connection, record, processed)
-
-    def save_batch(self, records: Iterable[tuple[SourceRecord, dict[str, Any]]]) -> int:
-        with closing(self.connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            return sum(self._save(connection, record, processed) for record, processed in records)
-
-    def save_detector_batch(self, records: Iterable[SourceRecord]) -> int:
-        with closing(self.connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            return self._save_detector_batch(connection, records)
-
-    def save_detector_backfill_batch(
-        self, records: Iterable[SourceRecord], synchronous: Literal["FULL", "NORMAL", "OFF"]
-    ) -> int:
-        if synchronous not in ("FULL", "NORMAL", "OFF"):
-            raise ValueError("Unsupported SQLite synchronous mode.")
-        with closing(self.connect()) as connection:
-            connection.execute(f"PRAGMA synchronous={synchronous}")
-            connection.execute("PRAGMA temp_store=MEMORY")
-            with connection:
-                connection.execute("BEGIN IMMEDIATE")
-                return self._save_detector_batch(connection, records)
-
-    def _save_detector_batch(
-        self, connection: sqlite3.Connection, records: Iterable[SourceRecord]
-    ) -> int:
-        batch = list(records)
-        times = [record.event_time for record in batch if record.event_time is not None]
-        has_legacy = bool(
-            times
-            and connection.execute(
-                "SELECT 1 FROM collected_records WHERE source='influx' "
-                "AND event_time>=? AND event_time<=? LIMIT 1",
-                (min(times), max(times)),
-            ).fetchone()
+        self.client.execute(
+            f"CREATE DATABASE IF NOT EXISTS {self.client.database}", database="default"
         )
-        saved = 0
-        for record in batch:
-            if record.source != "influx" or record.event_time is None or record.run_number is None:
-                raise ValueError("Detector batch requires complete Influx points.")
-            point_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
-            existing = (
-                connection.execute(
-                    "SELECT raw_json FROM collected_records WHERE source='influx' "
-                    "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
-                    (record.source_instance, record.source_id),
-                ).fetchone()
-                if has_legacy
-                else None
-            )
-            if existing is not None and existing["raw_json"] == point_json:
-                continue
-            inserted = connection.execute(
-                "INSERT INTO detector_points "
-                "(source_instance,source_id,event_time,run_number,point_json) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(source_instance,source_id) DO NOTHING",
-                (
-                    record.source_instance,
-                    record.source_id,
-                    record.event_time,
-                    record.run_number,
-                    point_json,
-                ),
-            ).rowcount
-            saved += inserted
-            if inserted and existing is None:
-                connection.execute(
-                    "INSERT INTO run_summaries "
-                    "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
-                    "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
-                    "started_at=MIN(started_at,excluded.started_at), "
-                    "point_count=point_count+1",
-                    (record.source_instance, record.run_number, record.event_time),
-                )
-            if not inserted:
-                saved += connection.execute(
-                    "UPDATE detector_points SET event_time=?,run_number=?,point_json=? "
-                    "WHERE source_instance=? AND source_id=? AND point_json<>?",
-                    (
-                        record.event_time,
-                        record.run_number,
-                        point_json,
-                        record.source_instance,
-                        record.source_id,
-                        point_json,
-                    ),
-                ).rowcount
-        return saved
-
-    def _save(
-        self, connection: sqlite3.Connection, record: SourceRecord, processed: dict[str, Any]
-    ) -> bool:
-        raw_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
-        processed_json = json.dumps(processed, sort_keys=True, allow_nan=False)
-        digest = hashlib.sha256(f"{raw_json}\0{processed_json}".encode()).hexdigest()
-        key = (record.source, record.source_instance, record.source_id)
-        previous = connection.execute(
-            "SELECT revision, content_hash, event_time, run_number "
-            "FROM collected_records WHERE source=? "
-            "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
-            key,
-        ).fetchone()
-        if previous is not None and previous["content_hash"] == digest:
-            return False
-        revision = previous["revision"] + 1 if previous is not None else 1
-        connection.execute(
-            "INSERT INTO collected_records (source,source_instance,source_id,revision,"
-            "content_hash,event_time,run_number,raw_json,processed_json,collected_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                *key,
-                revision,
-                digest,
-                record.event_time,
-                record.run_number,
-                raw_json,
-                processed_json,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        if record.source == "influx" and record.run_number is not None:
-            if previous is None:
-                connection.execute(
-                    "INSERT INTO run_summaries "
-                    "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
-                    "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
-                    "started_at=MIN(started_at,excluded.started_at), "
-                    "point_count=point_count+1",
-                    (record.source_instance, record.run_number, record.event_time),
-                )
-            elif (
-                previous["event_time"] != record.event_time
-                or previous["run_number"] != record.run_number
-            ):
-                self._refresh_run_summary(
-                    connection, record.source_instance, previous["run_number"]
-                )
-                self._refresh_run_summary(connection, record.source_instance, record.run_number)
-        return True
+        for statement in SCHEMA:
+            self.client.execute(statement)
 
     @staticmethod
-    def _refresh_run_summary(
-        connection: sqlite3.Connection, source_instance: str, run_number: str | None
-    ) -> None:
-        if run_number is None:
-            return
-        connection.execute(
-            "DELETE FROM run_summaries WHERE source_instance=? AND run_number=?",
-            (source_instance, run_number),
-        )
-        connection.execute(
-            "INSERT INTO run_summaries (source_instance,run_number,started_at,point_count) "
-            "SELECT source_instance,run_number,MIN(event_time),COUNT(*) "
-            "FROM collected_records AS r WHERE source='influx' AND source_instance=? "
-            "AND run_number=? AND NOT EXISTS ("
-            "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-            "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-            "AND newer.revision>r.revision) GROUP BY source_instance,run_number",
-            (source_instance, run_number),
-        )
-
-    def rebuild_run_summaries(self) -> int:
-        with closing(self.connect()) as connection, connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM run_summaries")
-            connection.execute(
-                "INSERT INTO run_summaries "
-                "(source_instance,run_number,started_at,point_count) "
-                "SELECT source_instance,run_number,MIN(event_time),COUNT(*) FROM ("
-                "SELECT r.source_instance,r.run_number,r.event_time "
-                "FROM collected_records AS r WHERE r.source='influx' "
-                "AND r.run_number IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-                "AND newer.revision>r.revision) "
-                "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
-                "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id) "
-                "UNION ALL "
-                "SELECT source_instance,run_number,event_time FROM detector_points) "
-                "GROUP BY source_instance,run_number"
-            )
-            return int(connection.execute("SELECT COUNT(*) FROM run_summaries").fetchone()[0])
-
-    def checkpoint(self, source: str) -> str | None:
-        with closing(self.connect()) as connection:
-            row = connection.execute(
-                "SELECT value FROM poll_checkpoints WHERE source=?", (source,)
-            ).fetchone()
-        return row["value"] if row else None
-
-    def set_checkpoint(self, source: str, value: str) -> None:
-        with closing(self.connect()) as connection, connection:
-            connection.execute(
-                "INSERT INTO poll_checkpoints(source,value) VALUES(?,?) "
-                "ON CONFLICT(source) DO UPDATE SET value=excluded.value",
-                (source, value),
-            )
-
-    def mark_synced(self, source: str, at: datetime) -> None:
-        with closing(self.connect()) as connection, connection:
-            connection.execute(
-                "INSERT INTO source_sync(source,last_success_at) VALUES(?,?) "
-                "ON CONFLICT(source) DO UPDATE SET last_success_at=excluded.last_success_at",
-                (source, at.astimezone(UTC).isoformat().replace("+00:00", "Z")),
-            )
-
-    def source_status(self) -> dict[str, dict[str, Any]]:
-        with closing(self.connect()) as connection:
-            synced = {
-                row["source"]: row["last_success_at"]
-                for row in connection.execute("SELECT source,last_success_at FROM source_sync")
-            }
-            checkpoints = {
-                row["source"]: row["value"]
-                for row in connection.execute("SELECT source,value FROM poll_checkpoints")
-            }
-            sources = {}
-            for name, condition in (
-                ("trigger", "source='trigger_history'"),
-                ("logbook", "source LIKE 'logbook_%'"),
-            ):
-                row = connection.execute(
-                    "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
-                    f"FROM collected_records WHERE {condition}"
-                ).fetchone()
-                sources[name] = {
-                    "earliest": row["earliest"],
-                    "latest": row["latest"],
-                    "lastSyncedAt": synced.get(name),
-                }
-            point_range = (
-                connection.execute(
-                    "SELECT event_time FROM detector_points "
-                    "ORDER BY event_time ASC LIMIT 1"
-                ).fetchone(),
-                connection.execute(
-                    "SELECT event_time FROM detector_points "
-                    "ORDER BY event_time DESC LIMIT 1"
-                ).fetchone(),
-            )
-            legacy_range = (
-                connection.execute(
-                    "SELECT event_time FROM collected_records "
-                    "WHERE source='influx' AND event_time IS NOT NULL "
-                    "ORDER BY event_time ASC LIMIT 1"
-                ).fetchone(),
-                connection.execute(
-                    "SELECT event_time FROM collected_records "
-                    "WHERE source='influx' AND event_time IS NOT NULL "
-                    "ORDER BY event_time DESC LIMIT 1"
-                ).fetchone(),
-            )
-        starts = [row[0] for row in (point_range[0], legacy_range[0]) if row and row[0]]
-        ends = [row[0] for row in (point_range[1], legacy_range[1]) if row and row[0]]
-        reverse_key = next(
-            (key for key in checkpoints if key.startswith("influx-backfill-reverse:")), None
-        )
-        sources["influx"] = {
-            "earliest": min(starts) if starts else None,
-            "latest": max(ends) if ends else None,
-            "lastSyncedAt": synced.get("influx"),
-            "scannedThrough": checkpoints.get("influx"),
-            "backfillCursor": checkpoints.get(reverse_key) if reverse_key else None,
-            "backfillUpper": (
-                checkpoints.get(reverse_key.replace("-reverse:", "-upper:"))
-                if reverse_key
-                else None
-            ),
-            "backfillLastSyncedAt": synced.get("influx_backfill"),
-        }
-        return sources
-
-    @staticmethod
-    def document(row: sqlite3.Row) -> dict[str, Any]:
+    def document(row: dict[str, Any]) -> dict[str, Any]:
         result = dict(row)
         result["raw"] = json.loads(result.pop("raw_json"))
         result["processed"] = json.loads(result.pop("processed_json"))
+        result.pop("version", None)
+        result.pop("event_ns", None)
         return result
 
-    def get(self, record_id: int) -> dict[str, Any] | None:
-        with closing(self.connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM collected_records WHERE id=?", (record_id,)
-            ).fetchone()
-        return self.document(row) if row else None
+    def save(self, record: SourceRecord, processed: dict[str, Any]) -> bool:
+        if record.source == "influx":
+            return bool(self.save_detector_batch([record]))
+        return self.save_batch([(record, processed)]) > 0
+
+    def save_batch(self, records: Iterable[tuple[SourceRecord, dict[str, Any]]]) -> int:
+        batch = list(records)
+        if not batch:
+            return 0
+        if any(record.source == "influx" for record, _ in batch):
+            raise ValueError("Detector records require save_detector_batch.")
+        previous = {
+            (row["source"], row["source_instance"], row["source_id"]): (
+                int(row["revision"]), row["content_hash"]
+            )
+            for row in self.client.query(
+                f"SELECT source,source_instance,source_id,revision,content_hash "
+                f"FROM ({latest_records()})"
+            )
+        }
+        rows = []
+        for record, processed in batch:
+            raw_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
+            processed_json = json.dumps(processed, sort_keys=True, allow_nan=False)
+            digest = hashlib.sha256(f"{raw_json}\0{processed_json}".encode()).hexdigest()
+            key = (record.source, record.source_instance, record.source_id)
+            revision, old_digest = previous.get(key, (0, ""))
+            if digest == old_digest:
+                continue
+            revision += 1
+            previous[key] = (revision, digest)
+            rows.append({
+                "id": record_id(*key, revision),
+                "source": record.source,
+                "source_instance": record.source_instance,
+                "source_id": record.source_id,
+                "revision": revision,
+                "content_hash": digest,
+                "event_time": record.event_time,
+                "event_ns": epoch_ns(record.event_time) if record.event_time else None,
+                "run_number": record.run_number,
+                "raw_json": raw_json,
+                "processed_json": processed_json,
+                "collected_at": datetime.now(UTC).isoformat(),
+                "version": time.time_ns(),
+            })
+        if rows:
+            self.client.insert("collected_records", rows)
+        return len(rows)
+
+    def save_detector_batch(self, records: Iterable[SourceRecord]) -> int:
+        rows = []
+        version = time.time_ns()
+        for record in records:
+            if record.source != "influx" or record.event_time is None or record.run_number is None:
+                raise ValueError("Detector batch requires complete Influx points.")
+            rows.append({
+                "source_instance": record.source_instance,
+                "source_id": record.source_id,
+                "event_ns": epoch_ns(record.event_time),
+                "event_time": record.event_time,
+                "run_number": record.run_number,
+                "point_json": json.dumps(record.raw, sort_keys=True, allow_nan=False),
+                "version": version,
+            })
+        self.client.insert("detector_points", rows)
+        return len(rows)
+
+    def save_detector_backfill_batch(self, records: Iterable[SourceRecord]) -> int:
+        return self.save_detector_batch(records)
+
+    def _state(self, kind: str, source: str) -> str | None:
+        rows = self.client.query(
+            "SELECT value FROM registry_state FINAL WHERE kind={kind:String} "
+            "AND source={source:String} LIMIT 1",
+            {"kind": kind, "source": source},
+        )
+        return str(rows[0]["value"]) if rows else None
+
+    def _set_state(self, kind: str, source: str, value: str) -> None:
+        self.client.insert(
+            "registry_state",
+            [{"kind": kind, "source": source, "value": value, "version": time.time_ns()}],
+        )
+
+    def checkpoint(self, source: str) -> str | None:
+        return self._state("checkpoint", source)
+
+    def set_checkpoint(self, source: str, value: str) -> None:
+        self._set_state("checkpoint", source, value)
+
+    def mark_synced(self, source: str, at: datetime) -> None:
+        self._set_state("synced", source, at.astimezone(UTC).isoformat().replace("+00:00", "Z"))
+
+    @staticmethod
+    def _event_at(value: int) -> str:
+        seconds, nanos = divmod(value, 1_000_000_000)
+        moment = datetime.fromtimestamp(seconds, UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        fraction = f".{nanos:09d}".rstrip("0") if nanos else ""
+        return f"{moment}{fraction}Z"
+
+    def source_status(self) -> dict[str, dict[str, Any]]:
+        state = {
+            (row["kind"], row["source"]): row["value"]
+            for row in self.client.query("SELECT kind,source,value FROM registry_state FINAL")
+        }
+        sources: dict[str, dict[str, Any]] = {}
+        for name, condition in (
+            ("trigger", "source='trigger_history'"),
+            ("logbook", "startsWith(source,'logbook_')"),
+        ):
+            rows = self.client.query(
+                "SELECT minOrNull(event_ns) AS first_ns,maxOrNull(event_ns) AS last_ns "
+                f"FROM ({latest_records()}) WHERE {condition}"
+            )
+            values = rows[0] if rows else {}
+            sources[name] = {
+                "earliest": (
+                    self._event_at(int(values["first_ns"])) if values.get("first_ns") else None
+                ),
+                "latest": self._event_at(int(values["last_ns"])) if values.get("last_ns") else None,
+                "lastSyncedAt": state.get(("synced", name)),
+            }
+        point_range = self.client.query(
+            "SELECT minOrNull(event_ns) AS first_ns,maxOrNull(event_ns) AS last_ns "
+            "FROM detector_points"
+        )
+        values = point_range[0] if point_range else {}
+        reverse_key = next(
+            (
+                key for kind, key in state
+                if kind == "checkpoint" and key.startswith("influx-backfill-reverse:")
+            ),
+            None,
+        )
+        sources["influx"] = {
+            "earliest": self._event_at(int(values["first_ns"])) if values.get("first_ns") else None,
+            "latest": self._event_at(int(values["last_ns"])) if values.get("last_ns") else None,
+            "lastSyncedAt": state.get(("synced", "influx")),
+            "scannedThrough": state.get(("checkpoint", "influx")),
+            "backfillCursor": state.get(("checkpoint", reverse_key)) if reverse_key else None,
+            "backfillUpper": (
+                state.get(("checkpoint", reverse_key.replace("-reverse:", "-upper:")))
+                if reverse_key else None
+            ),
+            "backfillLastSyncedAt": state.get(("synced", "influx_backfill")),
+        }
+        return sources
+
+    def get(self, identity: int) -> dict[str, Any] | None:
+        rows = self.client.query(
+            "SELECT * FROM collected_records FINAL WHERE id={identity:UInt64} LIMIT 1",
+            {"identity": identity},
+        )
+        return self.document(rows[0]) if rows else None
 
     def records(
         self, source: str | None, page: int, page_size: int
     ) -> tuple[list[dict[str, Any]], int]:
-        where = " WHERE r.source=?" if source else ""
-        params: tuple[Any, ...] = (source,) if source else ()
-        with closing(self.connect()) as connection:
-            count = connection.execute(
-                f"SELECT COUNT(*) FROM ({LATEST}{where})", params
-            ).fetchone()[0]
-            rows = connection.execute(
-                f"{LATEST}{where} ORDER BY r.id DESC LIMIT ? OFFSET ?",
-                (*params, page_size, (page - 1) * page_size),
-            ).fetchall()
-        return [self.document(row) for row in rows], count
-
-    def run_stats(self) -> list[dict[str, Any]]:
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                "SELECT source_instance,run_number,started_at,point_count FROM run_summaries"
-            ).fetchall()
-        return [dict(row) for row in rows]
+        params: dict[str, str | int] = {"limit": page_size, "offset": (page - 1) * page_size}
+        if source is not None:
+            params["source"] = source
+        latest = latest_records(source)
+        total = self.client.query(f"SELECT count() AS total FROM ({latest})", params)[0]["total"]
+        rows = self.client.query(
+            f"SELECT * FROM ({latest}) ORDER BY event_ns DESC,id DESC "
+            "LIMIT {limit:UInt32} OFFSET {offset:UInt64}",
+            params,
+        )
+        return [self.document(row) for row in rows], int(total)
 
     def trigger_runs(self) -> list[dict[str, Any]]:
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                "SELECT r.* FROM collected_records AS r WHERE r.source='trigger_history' "
-                "AND r.event_time IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-                "AND newer.revision>r.revision) "
-                "ORDER BY r.event_time,r.source_instance,r.source_id"
-            ).fetchall()
+        rows = self.client.query(
+            f"SELECT * FROM ({latest_records('trigger_history')}) "
+            "WHERE event_ns IS NOT NULL ORDER BY event_ns,source_instance,source_id",
+            {"source": "trigger_history"},
+        )
         return [self.document(row) for row in rows]
 
     def beam_events(self) -> list[dict[str, Any]]:
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                "SELECT r.* FROM collected_records AS r WHERE r.source='logbook_event' "
-                "AND r.event_time IS NOT NULL AND NOT EXISTS ("
-                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-                "AND newer.revision>r.revision) ORDER BY r.event_time,r.id"
-            ).fetchall()
-        events = []
-        for row in rows:
-            record = self.document(row)
-            if record["raw"].get("category") == "Beam" and record["raw"].get(
-                "is_active", True
-            ):
-                events.append(record)
-        return events
+        rows = self.client.query(
+            f"SELECT * FROM ({latest_records('logbook_event')}) "
+            "WHERE event_ns IS NOT NULL ORDER BY event_ns,id",
+            {"source": "logbook_event"},
+        )
+        records = [self.document(row) for row in rows]
+        return [
+            record for record in records
+            if record["raw"].get("category") == "Beam" and record["raw"].get("is_active", True)
+        ]
 
     @staticmethod
-    def _interval(start: str, end: str | None) -> tuple[str, tuple[str, ...]]:
-        condition = "r.event_time>=?"
-        parameters: tuple[str, ...] = (start.removesuffix("Z"),)
+    def _interval(start: str, end: str | None) -> tuple[str, dict[str, int]]:
+        params = {"start": epoch_ns(start)}
+        condition = "event_ns>={start:Int64}"
         if end is not None:
-            condition += " AND r.event_time<?"
-            parameters += (end.removesuffix("Z"),)
-        return condition, parameters
+            params["end"] = epoch_ns(end)
+            condition += " AND event_ns<{end:Int64}"
+        return condition, params
 
     def influx_origin(self, start: str, end: str | None) -> dict[str, str] | None:
-        condition, parameters = self._interval(start, end)
-        with closing(self.connect()) as connection:
-            point = connection.execute(
-                f"SELECT source_instance,run_number FROM detector_points AS r WHERE {condition} "
-                "LIMIT 1",
-                parameters,
-            ).fetchone()
-            if point is not None:
-                return dict(point)
-            row = connection.execute(
-                f"SELECT r.source_instance,r.run_number FROM collected_records AS r "
-                f"WHERE r.source='influx' "
-                f"AND {condition} AND NOT EXISTS ("
-                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-                "AND newer.revision>r.revision) LIMIT 1",
-                parameters,
-            ).fetchone()
-        return dict(row) if row is not None else None
+        condition, params = self._interval(start, end)
+        rows = self.client.query(
+            "SELECT source_instance,run_number FROM detector_points FINAL "
+            f"WHERE {condition} LIMIT 1",
+            params,
+        )
+        if not rows:
+            return None
+        return {
+            "source_instance": rows[0]["source_instance"],
+            "run_number": rows[0]["run_number"],
+        }
 
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
-        condition, parameters = self._interval(start, end)
-        with closing(self.connect()) as connection:
-            cursor = connection.execute(
-                "SELECT source_instance,source_id,event_time,point_json "
-                f"FROM detector_points AS r WHERE {condition} "
-                "UNION ALL "
-                "SELECT r.source_instance,r.source_id,r.event_time,r.raw_json AS point_json "
-                f"FROM collected_records AS r WHERE r.source='influx' AND {condition} "
-                "AND NOT EXISTS (SELECT 1 FROM collected_records AS newer "
-                "WHERE newer.source=r.source AND newer.source_instance=r.source_instance "
-                "AND newer.source_id=r.source_id AND newer.revision>r.revision) "
-                "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
-                "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id) "
-                "ORDER BY event_time",
-                (*parameters, *parameters),
-            )
-            for row in cursor:
-                yield json.loads(row["point_json"])
-
-    def iter_interval(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
-        condition, parameters = self._interval(start, end)
-        with closing(self.connect()) as connection:
-            cursor = connection.execute(
-                "SELECT r.* FROM collected_records AS r WHERE r.source='influx' "
-                f"AND {condition} AND NOT EXISTS ("
-                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
-                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
-                "AND newer.revision>r.revision) ORDER BY r.event_time,r.id",
-                parameters,
-            )
-            for row in cursor:
-                yield self.document(row)
-
-    def iter_run(self, source_instance: str, run_number: str) -> Iterator[dict[str, Any]]:
-        with closing(self.connect()) as connection:
-            cursor = connection.execute(
-                f"{LATEST} WHERE r.source='influx' AND r.source_instance=? "
-                "AND r.run_number=? "
-                "ORDER BY r.event_time,r.id",
-                (source_instance, run_number),
-            )
-            for row in cursor:
-                yield self.document(row)
+        condition, params = self._interval(start, end)
+        for row in self.client.iterate(
+            f"SELECT point_json FROM detector_points FINAL WHERE {condition} "
+            "ORDER BY event_ns,source_instance,source_id",
+            params,
+        ):
+            yield json.loads(row["point_json"])

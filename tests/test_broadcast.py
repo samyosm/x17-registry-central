@@ -26,7 +26,7 @@ def test_influx_annotated_csv_and_checkpoint(monkeypatch, store):
 
     monkeypatch.setattr("x17_registry.adapters.readers.urlopen", local_query)
     settings = poll_settings(
-        store.path,
+        store.client.database,
         influx_enabled=True,
         influx_url="http://127.0.0.1:18888",
         influx_org="UdeM",
@@ -47,7 +47,7 @@ def test_influx_annotated_csv_and_checkpoint(monkeypatch, store):
     assert len(records) == 2
     assert {record["_field"] for record in records} == {"trignum", "ADCA"}
     assert store.records("influx", 1, 10)[1] == 0
-    assert store.run_stats()[0]["run_number"] == "80"
+    assert store.influx_origin("2026-09-27T13:00:00Z", None)["run_number"] == "80"
 
 
 def test_malformed_influx_row_does_not_advance_checkpoint(monkeypatch, store):
@@ -56,7 +56,7 @@ def test_malformed_influx_row_does_not_advance_checkpoint(monkeypatch, store):
         lambda request, timeout: io.BytesIO(CSV.replace("run_80,2,ADCA", "run_80,,ADCA").encode()),
     )
     settings = poll_settings(
-        store.path,
+        store.client.database,
         influx_enabled=True,
         influx_url="http://127.0.0.1:18888",
         influx_org="UdeM",

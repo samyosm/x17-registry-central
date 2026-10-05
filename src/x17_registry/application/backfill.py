@@ -62,7 +62,7 @@ def backfill_influx(
     started = monotonic()
     output_lock = Lock()
     stopped = Event()
-    timings = {"influx": 0.0, "sqlite": 0.0}
+    timings = {"influx": 0.0, "clickhouse": 0.0}
     phase_started = monotonic()
     state: dict[str, object] = {
         "cursor": cursor.isoformat(),
@@ -84,7 +84,7 @@ def backfill_influx(
                     "elapsed_seconds": round(monotonic() - started, 1),
                     **state,
                     "influx_seconds": round(timings["influx"], 3),
-                    "sqlite_seconds": round(timings["sqlite"], 3),
+                    "clickhouse_seconds": round(timings["clickhouse"], 3),
                     "phase_seconds": round(phase_elapsed, 1),
                     **details,
                 }
@@ -112,22 +112,20 @@ def backfill_influx(
 
     def write_batch(batch: list[SourceRecord]) -> tuple[int, float]:
         began = monotonic()
-        saved = store.save_detector_backfill_batch(
-            batch, settings.influx_backfill_sqlite_synchronous
-        )
+        saved = store.save_detector_backfill_batch(batch)
         return saved, monotonic() - began
 
     def collect_one() -> None:
         nonlocal records_saved
-        phase("waiting_sqlite")
+        phase("waiting_clickhouse")
         try:
             saved, elapsed = pending.popleft().result()
         except Exception as error:
             raise RuntimeError(
-                "SQLite backfill batch failed; checkpoint was not advanced."
+                "ClickHouse backfill batch failed; checkpoint was not advanced."
             ) from error
         records_saved += saved
-        timings["sqlite"] += elapsed
+        timings["clickhouse"] += elapsed
         state["records_saved"] = records_saved
         state["pending_batches"] = len(pending)
         phase("reading_influx")
@@ -164,7 +162,7 @@ def backfill_influx(
                 write_batches=0,
             )
             timings["influx"] = 0.0
-            timings["sqlite"] = 0.0
+            timings["clickhouse"] = 0.0
             write_batches = 0
             phase("window_start")
             report("window_started")

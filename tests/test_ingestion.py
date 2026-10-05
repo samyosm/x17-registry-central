@@ -12,7 +12,7 @@ from x17_registry.application.polling import IdentityProcessor, PollJob
 def test_local_trigger_json_and_logbook_sqlite_are_read_only(store):
     source = ROOT / "x17-ops/x17-logbook/data/logbook.db"
     digest_before = hashlib.sha256(source.read_bytes()).hexdigest()
-    settings = poll_settings(store.path)
+    settings = poll_settings(store.client.database)
     trigger, _ = TriggerReader(settings).read(None, datetime.now(UTC))
     logbook, _ = LogbookReader(settings).read(None, datetime.now(UTC))
     trigger_records = list(trigger)
@@ -33,7 +33,7 @@ def test_local_trigger_json_and_logbook_sqlite_are_read_only(store):
 
 
 def test_poll_stores_raw_and_processed_copies_without_duplicate_versions(store):
-    settings = poll_settings(store.path)
+    settings = poll_settings(store.client.database)
     job = PollJob(
         {"trigger": TriggerReader(settings), "logbook": LogbookReader(settings)},
         IdentityProcessor(),
@@ -69,7 +69,7 @@ def test_old_logbook_row_edit_creates_revision(store, tmp_path: Path):
             "INSERT INTO condition_events VALUES(1,?,?,?,?,?,?)",
             ("Run4_B1", "2026-09-25 13:00:00", "Beam", '{"status":"ON"}', "", 1),
         )
-    settings = poll_settings(store.path, logbook_database_path=source)
+    settings = poll_settings(store.client.database, logbook_database_path=source)
     job = PollJob({"logbook": LogbookReader(settings)}, IdentityProcessor(), store, 1000)
     assert job.run_once() == {"logbook": 1}
     with sqlite3.connect(source) as connection:

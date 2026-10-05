@@ -8,8 +8,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class CommonSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="X17_", env_file=".env", extra="ignore")
 
-    database_path: Path
-    sqlite_timeout_seconds: float = Field(gt=0)
+    clickhouse_url: str
+    clickhouse_database: str
+    clickhouse_user: str
+    clickhouse_password: SecretStr
+    clickhouse_timeout_seconds: float = Field(gt=0)
     log_level: Literal["critical", "error", "warning", "info", "debug"]
 
 
@@ -83,8 +86,6 @@ class PollSettings(CommonSettings):
                 )
             if self.influx_token is not None and not self.influx_token.get_secret_value():
                 raise ValueError("Enabled Influx polling requires a nonempty token.")
-        if self.database_path.resolve() == self.logbook_database_path.resolve():
-            raise ValueError("The registry database must differ from the source logbook database.")
         if self.influx_overlap_seconds >= self.influx_window_seconds:
             raise ValueError("Influx overlap must be shorter than its polling window.")
         return self
@@ -95,4 +96,3 @@ class BackfillSettings(PollSettings):
     influx_backfill_progress_seconds: float = Field(gt=0)
     influx_backfill_pending_batches: int = Field(gt=0)
     influx_backfill_runs_only: bool
-    influx_backfill_sqlite_synchronous: Literal["FULL", "NORMAL", "OFF"]

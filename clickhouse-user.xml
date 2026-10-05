@@ -1,0 +1,14 @@
+<clickhouse>
+    <users>
+        <x17_registry>
+            <password from_env="X17_CLICKHOUSE_PASSWORD"/>
+            <networks>
+                <ip>127.0.0.1</ip>
+                <ip>::1</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </x17_registry>
+    </users>
+</clickhouse>

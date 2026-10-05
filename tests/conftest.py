@@ -1,9 +1,13 @@
+import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from embedded_clickhouse import EmbeddedClickHouse
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from x17_registry.adapters.clickhouse import ClickHouseClient
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.api.app import create_app
 from x17_registry.config import PollSettings, Settings
@@ -11,11 +15,14 @@ from x17_registry.config import PollSettings, Settings
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def server_settings(database_path: Path) -> Settings:
+def server_settings(database: str) -> Settings:
     return Settings(
         _env_file=None,
-        database_path=database_path,
-        sqlite_timeout_seconds=5,
+        clickhouse_url=os.environ.get("X17_TEST_CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+        clickhouse_database=database,
+        clickhouse_user=os.environ.get("X17_TEST_CLICKHOUSE_USER", "default"),
+        clickhouse_password=SecretStr(os.environ.get("X17_TEST_CLICKHOUSE_PASSWORD", "")),
+        clickhouse_timeout_seconds=5,
         log_level="info",
         host="127.0.0.1",
         port=8000,
@@ -26,10 +33,13 @@ def server_settings(database_path: Path) -> Settings:
     )
 
 
-def poll_settings(database_path: Path, **overrides) -> PollSettings:
+def poll_settings(database: str, **overrides) -> PollSettings:
     values = {
-        "database_path": database_path,
-        "sqlite_timeout_seconds": 5,
+        "clickhouse_url": os.environ.get("X17_TEST_CLICKHOUSE_URL", "http://127.0.0.1:8123"),
+        "clickhouse_database": f"x17_test_{uuid4().hex}",
+        "clickhouse_user": os.environ.get("X17_TEST_CLICKHOUSE_USER", "default"),
+        "clickhouse_password": SecretStr(os.environ.get("X17_TEST_CLICKHOUSE_PASSWORD", "")),
+        "clickhouse_timeout_seconds": 5,
         "log_level": "info",
         "poll_interval_seconds": 5,
         "trigger_history_path": ROOT / "triggerApp/trigger/data/trigger_history.json",
@@ -57,13 +67,25 @@ def poll_settings(database_path: Path, **overrides) -> PollSettings:
 
 @pytest.fixture
 def store(tmp_path: Path) -> RegistryStore:
-    result = RegistryStore(tmp_path / "registry.sqlite3", 5)
+    url = os.environ.get("X17_TEST_CLICKHOUSE_URL")
+    if not url:
+        chdb = pytest.importorskip("chdb")
+        client = EmbeddedClickHouse(chdb)
+    else:
+        client = ClickHouseClient(
+            url, f"x17_test_{uuid4().hex}",
+            os.environ.get("X17_TEST_CLICKHOUSE_USER", "default"),
+            os.environ.get("X17_TEST_CLICKHOUSE_PASSWORD", ""), 5,
+        )
+    result = RegistryStore(client)
     result.initialize()
-    return result
+    yield result
+    if not url:
+        client.close()
 
 
 @pytest.fixture
 def client(store: RegistryStore):
-    with TestClient(create_app(server_settings(store.path), store)) as result:
+    with TestClient(create_app(server_settings(store.client.database), store)) as result:
         result.headers["Authorization"] = "Bearer test-token"
         yield result

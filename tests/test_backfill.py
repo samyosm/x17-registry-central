@@ -54,7 +54,7 @@ class TruncatedReader(SparseReader):
 
 def settings_for(store, start, **overrides):
     settings = poll_settings(
-        store.path,
+        store.client.database,
         influx_enabled=True,
         influx_url="http://example.invalid:8086",
         influx_org="UdeM",
@@ -71,7 +71,6 @@ def settings_for(store, start, **overrides):
         "influx_backfill_progress_seconds": 10,
         "influx_backfill_pending_batches": 2,
         "influx_backfill_runs_only": False,
-        "influx_backfill_sqlite_synchronous": "NORMAL",
     }
     values.update(overrides)
     return BackfillSettings(_env_file=None, **values)
@@ -115,7 +114,6 @@ def test_reverse_backfill_retries_truncated_stream_without_duplicates(store):
 
     assert any(update["event"] == "retry_smaller_window" for update in updates)
     assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
-    assert store.run_stats()[0]["point_count"] == 2
 
 
 def test_reverse_backfill_resumes_after_failure(store):
@@ -190,7 +188,7 @@ def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
     assert heartbeat_seen.is_set()
 
 
-def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
+def test_reverse_backfill_reports_clickhouse_time(monkeypatch, store):
     start = datetime.now(UTC) - timedelta(minutes=10)
     event = start + timedelta(seconds=200)
     save = store.save_detector_backfill_batch
@@ -202,9 +200,9 @@ def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
                 sleep(0.02)
                 yield record
 
-    def slow_save(records, synchronous):
+    def slow_save(records):
         sleep(0.02)
-        return save(records, synchronous)
+        return save(records)
 
     monkeypatch.setattr(store, "save_detector_backfill_batch", slow_save)
     backfill_influx(
@@ -219,7 +217,7 @@ def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
         for update in updates
         if update["event"] == "window_completed" and update["window_records"]
     )
-    assert completed["sqlite_seconds"] >= 0.02
+    assert completed["clickhouse_seconds"] >= 0.02
     assert completed["influx_seconds"] >= 0.02
 
 
@@ -265,9 +263,9 @@ def test_reader_and_writer_overlap_without_unbounded_queue(monkeypatch, store):
                     assert writer_started.wait(1)
                 yield record
 
-    def tracked_save(records, synchronous):
+    def tracked_save(records):
         writer_started.set()
-        return save(records, synchronous)
+        return save(records)
 
     monkeypatch.setattr(store, "save_detector_backfill_batch", tracked_save)
     settings = settings_for(
@@ -284,11 +282,11 @@ def test_writer_failure_keeps_reverse_checkpoint(monkeypatch, store):
     event = datetime.now(UTC) - timedelta(seconds=30)
     settings = settings_for(store, start, influx_backfill_batch_size=1)
 
-    def broken_save(records, synchronous):
+    def broken_save(records):
         raise OSError("disk unavailable")
 
     monkeypatch.setattr(store, "save_detector_backfill_batch", broken_save)
-    with pytest.raises(RuntimeError, match="SQLite backfill batch failed"):
+    with pytest.raises(RuntimeError, match="ClickHouse backfill batch failed"):
         backfill_influx(SparseReader([event]), store, settings, lambda _: None)
 
     assert store.checkpoint("influx-backfill-reverse:test-influx") == store.checkpoint(

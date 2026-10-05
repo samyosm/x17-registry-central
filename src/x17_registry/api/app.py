@@ -4,7 +4,6 @@ import io
 import json
 import logging
 import secrets
-import sqlite3
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from datetime import date
@@ -14,6 +13,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from x17_registry.adapters.clickhouse import ClickHouseClient, ClickHouseError
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.beam import beam_context
 from x17_registry.config import Settings
@@ -135,7 +135,15 @@ def run_windows(store: RegistryStore) -> list[tuple[dict[str, Any], str | None]]
 
 
 def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAPI:
-    registry = store or RegistryStore(settings.database_path, settings.sqlite_timeout_seconds)
+    registry = store or RegistryStore(
+        ClickHouseClient(
+            settings.clickhouse_url,
+            settings.clickhouse_database,
+            settings.clickhouse_user,
+            settings.clickhouse_password.get_secret_value(),
+            settings.clickhouse_timeout_seconds,
+        )
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -156,10 +164,10 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         ):
             raise HTTPException(401, "Invalid bearer token", headers={"WWW-Authenticate": "Bearer"})
 
-    @app.exception_handler(sqlite3.Error)
-    async def storage_error(request: Request, error: sqlite3.Error) -> JSONResponse:
+    @app.exception_handler(ClickHouseError)
+    async def storage_error(request: Request, error: ClickHouseError) -> JSONResponse:
         logging.getLogger(__name__).error(
-            "Registry SQLite error", exc_info=(type(error), error, error.__traceback__)
+            "Registry ClickHouse error", exc_info=(type(error), error, error.__traceback__)
         )
         return JSONResponse(
             status_code=503,
