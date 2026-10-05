@@ -11,7 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from x17_registry.application.polling import SourceReader, SourceRecord
+from x17_registry.application.polling import SeekableInfluxReader, SourceReader, SourceRecord
 from x17_registry.config import PollSettings
 
 RUN_MEASUREMENT = re.compile(r"^run_(\d+)$")
@@ -135,7 +135,7 @@ def flux_csv_rows(response: Iterable[str]) -> Iterator[dict[str, str]]:
             yield dict(zip(columns, row, strict=True))
 
 
-class InfluxReader(SourceReader):
+class InfluxReader(SeekableInfluxReader):
     def __init__(self, settings: PollSettings) -> None:
         self.settings = settings
 
@@ -159,13 +159,7 @@ class InfluxReader(SourceReader):
 
     def _query(self, start: datetime, stop: datetime) -> Iterator[SourceRecord]:
         settings = self.settings
-        if (
-            settings.influx_url is None
-            or settings.influx_org is None
-            or settings.influx_bucket is None
-            or settings.influx_token is None
-            or settings.influx_source_instance is None
-        ):
+        if settings.influx_bucket is None or settings.influx_source_instance is None:
             raise ValueError("InfluxDB polling settings are incomplete.")
         bucket = json.dumps(settings.influx_bucket)
         start_text = start.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -175,19 +169,7 @@ class InfluxReader(SourceReader):
             f"  |> range(start: {start_text}, stop: {stop_text})\n"
             "  |> filter(fn: (r) => r._measurement =~ /^run_[0-9]+$/)"
         )
-        query_parameters = urlencode({"org": settings.influx_org})
-        url = f"{settings.influx_url.rstrip('/')}/api/v2/query?{query_parameters}"
-        request = Request(
-            url,
-            data=query.encode(),
-            headers={
-                "Authorization": f"Token {settings.influx_token.get_secret_value()}",
-                "Accept": "application/csv",
-                "Content-Type": "application/vnd.flux",
-            },
-            method="POST",
-        )
-        with urlopen(request, timeout=settings.influx_timeout_seconds) as response:
+        with urlopen(self._request(query), timeout=settings.influx_timeout_seconds) as response:
             with io.TextIOWrapper(response, encoding="utf-8") as stream:
                 for row in flux_csv_rows(stream):
                     measurement = row.get("_measurement", "")
@@ -215,3 +197,58 @@ class InfluxReader(SourceReader):
                         timestamp,
                         match.group(1),
                     )
+
+    def next_point_at(self, start: datetime, stop: datetime) -> datetime | None:
+        settings = self.settings
+        if settings.influx_bucket is None:
+            raise ValueError("InfluxDB polling settings are incomplete.")
+        if start >= stop:
+            return None
+        start_text = start.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        stop_text = stop.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        query = (
+            f"from(bucket: {json.dumps(settings.influx_bucket)})\n"
+            f"  |> range(start: {start_text}, stop: {stop_text})\n"
+            "  |> filter(fn: (r) => r._measurement =~ /^run_[0-9]+$/)\n"
+            "  |> first()\n"
+            '  |> keep(columns: ["_time"])\n'
+            "  |> group(columns: [])\n"
+            '  |> min(column: "_time")'
+        )
+        with urlopen(self._request(query), timeout=settings.influx_timeout_seconds) as response:
+            with io.TextIOWrapper(response, encoding="utf-8") as stream:
+                columns: list[str] = []
+                for row in csv.reader(stream):
+                    if not row or row[0].startswith("#"):
+                        continue
+                    if "_time" in row:
+                        columns = row
+                        continue
+                    if columns:
+                        values = dict(zip(columns, row, strict=True))
+                        timestamp = values.get("_time")
+                        if timestamp:
+                            return datetime.fromisoformat(utc_iso(timestamp).replace("Z", "+00:00"))
+                    else:
+                        raise ValueError("InfluxDB next-point response has no _time column.")
+        return None
+
+    def _request(self, query: str) -> Request:
+        settings = self.settings
+        if (
+            settings.influx_url is None
+            or settings.influx_org is None
+            or settings.influx_token is None
+        ):
+            raise ValueError("InfluxDB polling settings are incomplete.")
+        parameters = urlencode({"org": settings.influx_org})
+        return Request(
+            f"{settings.influx_url.rstrip('/')}/api/v2/query?{parameters}",
+            data=query.encode(),
+            headers={
+                "Authorization": f"Token {settings.influx_token.get_secret_value()}",
+                "Accept": "application/csv",
+                "Content-Type": "application/vnd.flux",
+            },
+            method="POST",
+        )

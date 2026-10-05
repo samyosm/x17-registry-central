@@ -70,7 +70,9 @@ def run_detail(
             "VF48 / InfluxDB v2"
             f" / {detector_origin['source_instance']}"
             f" / run_{detector_origin['run_number']}"
-        ] if detector_origin is not None else [],
+        ]
+        if detector_origin is not None
+        else [],
         "beam": {
             "status": "unknown",
             "source": "No verified run association",

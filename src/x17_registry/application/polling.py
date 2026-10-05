@@ -25,6 +25,12 @@ class SourceReader(ABC):
         raise NotImplementedError
 
 
+class SeekableInfluxReader(SourceReader, ABC):
+    @abstractmethod
+    def next_point_at(self, start: datetime, stop: datetime) -> datetime | None:
+        raise NotImplementedError
+
+
 class Processor(ABC):
     @abstractmethod
     def process(self, record: SourceRecord) -> dict[str, Any]:

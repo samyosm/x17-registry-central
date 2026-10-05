@@ -8,9 +8,18 @@ def test_interface_run_routes_and_download(client, store):
     ):
         store.save(
             SourceRecord(
-                "trigger_history", "test-trigger", entry_id,
-                {"id": entry_id, "timestamp": started_at, "title": title,
-                 "tmod": "2", "maj": 2, "thresholds": {"F0A": 120}, "note": ""},
+                "trigger_history",
+                "test-trigger",
+                entry_id,
+                {
+                    "id": entry_id,
+                    "timestamp": started_at,
+                    "title": title,
+                    "tmod": "2",
+                    "maj": 2,
+                    "thresholds": {"F0A": 120},
+                    "note": "",
+                },
                 started_at,
             ),
             {"title": title},
@@ -22,8 +31,12 @@ def test_interface_run_routes_and_download(client, store):
     ):
         store.save(
             SourceRecord(
-                "influx", "test-influx", point_id,
-                {"_measurement": "run_80", "_value": point_id}, at, "80",
+                "influx",
+                "test-influx",
+                point_id,
+                {"_measurement": "run_80", "_value": point_id},
+                at,
+                "80",
             ),
             {"_value": point_id},
         )
@@ -49,9 +62,10 @@ def test_interface_run_routes_and_download(client, store):
     second = client.get("/api/v1/runs?q=Beam on").json()["runs"][0]
     second_detail = client.get(f"/api/v1/runs/{second['id']}").json()
     assert second_detail["endedAt"] is None
-    assert [row["raw"]["_value"] for row in client.get(
-        second_detail["artifacts"][0]["downloadUrl"]
-    ).json()] == ["boundary"]
+    assert [
+        row["raw"]["_value"]
+        for row in client.get(second_detail["artifacts"][0]["downloadUrl"]).json()
+    ] == ["boundary"]
     assert client.get("/api/v1/runs").json()["total"] == 2
     assert client.get("/api/v1/runs?q=absent").json()["runs"] == []
     assert client.get("/api/v1/runs/unknown").status_code == 404
@@ -75,22 +89,29 @@ def test_trigger_only_run_and_late_next_write(client, store):
     second_time = "2026-09-27T15:00:00Z"
     store.save(
         SourceRecord(
-            "trigger_history", "test-trigger", "first-write",
-            {"id": "first-write", "title": "Calibration", "timestamp": first_time}, first_time,
+            "trigger_history",
+            "test-trigger",
+            "first-write",
+            {"id": "first-write", "title": "Calibration", "timestamp": first_time},
+            first_time,
         ),
         {"title": "Calibration"},
     )
     first = client.get("/api/v1/runs").json()["runs"][0]
     assert first["artifactCount"] == 0
     assert client.get(f"/api/v1/runs/{first['id']}").json()["endedAt"] is None
-    assert client.get(
-        f"/api/v1/runs/{first['id']}/artifacts/detector-records/download"
-    ).status_code == 404
+    assert (
+        client.get(f"/api/v1/runs/{first['id']}/artifacts/detector-records/download").status_code
+        == 404
+    )
 
     store.save(
         SourceRecord(
-            "trigger_history", "test-trigger", "second-write",
-            {"id": "second-write", "title": "Beam", "timestamp": second_time}, second_time,
+            "trigger_history",
+            "test-trigger",
+            "second-write",
+            {"id": "second-write", "title": "Beam", "timestamp": second_time},
+            second_time,
         ),
         {"title": "Beam"},
     )

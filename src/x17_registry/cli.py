@@ -8,6 +8,7 @@ import uvicorn
 from x17_registry.adapters.readers import InfluxReader, LogbookReader, TriggerReader
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.api.app import create_app
+from x17_registry.application.backfill import backfill_influx
 from x17_registry.application.polling import IdentityProcessor, PollJob, SourceReader
 from x17_registry.config import CommonSettings, PollSettings, Settings
 
@@ -26,7 +27,10 @@ def build_job(settings: PollSettings) -> PollJob:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="X17 registry service")
-    parser.add_argument("command", choices=("serve", "poll", "poll-once", "rebuild-run-summaries"))
+    parser.add_argument(
+        "command",
+        choices=("serve", "poll", "poll-once", "backfill-influx", "rebuild-run-summaries"),
+    )
     command = parser.parse_args().command
     if command == "serve":
         settings = Settings()
@@ -46,6 +50,19 @@ def main() -> None:
         return
     poll_settings = PollSettings()
     logging.basicConfig(level=poll_settings.log_level.upper())
+    if command == "backfill-influx":
+        if not poll_settings.influx_enabled:
+            raise SystemExit("X17_INFLUX_ENABLED must be true for backfill.")
+        store = RegistryStore(poll_settings.database_path, poll_settings.sqlite_timeout_seconds)
+        store.initialize()
+        result = backfill_influx(
+            InfluxReader(poll_settings),
+            store,
+            poll_settings,
+            lambda update: print(json.dumps(update), flush=True),
+        )
+        print(json.dumps(result))
+        return
     job = build_job(poll_settings)
     if command == "poll-once":
         result = job.run_once()
