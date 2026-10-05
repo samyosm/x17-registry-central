@@ -2,6 +2,7 @@ import io
 from datetime import UTC, datetime, timedelta
 from http.client import IncompleteRead
 from threading import Event
+from time import sleep
 
 import pytest
 from conftest import poll_settings
@@ -132,10 +133,42 @@ def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
 
     def progress(update):
         if update["event"] == "heartbeat":
+            assert update["phase"] == "reading_influx"
+            assert update["phase_seconds"] >= 0
             heartbeat_seen.set()
 
     backfill_influx(WaitingReader([]), store, settings_for(store, start), 1, 0.01, 2, progress)
     assert heartbeat_seen.is_set()
+
+
+def test_reverse_backfill_reports_sqlite_time(monkeypatch, store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    event = start + timedelta(seconds=200)
+    save = store.save_detector_batch
+    updates = []
+
+    class SlowReader(SparseReader):
+        def read_window(self, start, stop):
+            for record in super().read_window(start, stop):
+                sleep(0.02)
+                yield record
+
+    def slow_save(records):
+        sleep(0.02)
+        return save(records)
+
+    monkeypatch.setattr(store, "save_detector_batch", slow_save)
+    backfill_influx(
+        SlowReader([event]), store, settings_for(store, start), 1, 10, 1, updates.append
+    )
+
+    completed = next(
+        update
+        for update in updates
+        if update["event"] == "window_completed" and update["window_records"]
+    )
+    assert completed["sqlite_seconds"] >= 0.02
+    assert completed["influx_seconds"] >= 0.02
 
 
 def test_previous_point_query_uses_last_and_max(monkeypatch, store):

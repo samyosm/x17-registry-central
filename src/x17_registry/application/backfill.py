@@ -59,24 +59,36 @@ def backfill_influx(
     started = monotonic()
     output_lock = Lock()
     stopped = Event()
+    timings = {"influx": 0.0, "sqlite": 0.0}
+    phase_started = monotonic()
     state: dict[str, object] = {
         "cursor": cursor.isoformat(),
         "percent_time_scanned": _progress_percent(lower, upper, cursor),
         "window_records": 0,
         "records_read": 0,
         "records_saved": 0,
+        "phase": "starting",
     }
 
     def report(event: str, **details: object) -> None:
         with output_lock:
+            phase_elapsed = monotonic() - phase_started
             progress(
                 {
                     "event": event,
                     "elapsed_seconds": round(monotonic() - started, 1),
                     **state,
+                    "influx_seconds": round(timings["influx"], 3),
+                    "sqlite_seconds": round(timings["sqlite"], 3),
+                    "phase_seconds": round(phase_elapsed, 1),
                     **details,
                 }
             )
+
+    def phase(name: str) -> None:
+        nonlocal phase_started
+        state["phase"] = name
+        phase_started = monotonic()
 
     def heartbeat() -> None:
         while not stopped.wait(progress_seconds):
@@ -93,9 +105,13 @@ def backfill_influx(
     def flush(batch: list[SourceRecord]) -> None:
         nonlocal records_saved
         if batch:
+            phase("sqlite_write")
+            write_started = monotonic()
             records_saved += store.save_detector_batch(batch)
+            timings["sqlite"] += monotonic() - write_started
             state["records_saved"] = records_saved
             batch.clear()
+            phase("reading_influx")
 
     try:
         report("started", oldest_requested=lower.isoformat(), newest=upper.isoformat())
@@ -107,11 +123,24 @@ def backfill_influx(
                 window_records=0,
                 window_seconds=window_seconds,
             )
+            timings["influx"] = 0.0
+            timings["sqlite"] = 0.0
+            phase("window_start")
             report("window_started")
             count = 0
             batch: list[SourceRecord] = []
             try:
-                for record in reader.read_window(start, cursor):
+                phase("reading_influx")
+                stream = iter(reader.read_window(start, cursor))
+                while True:
+                    phase("reading_influx")
+                    read_started = monotonic()
+                    try:
+                        record = next(stream)
+                    except StopIteration:
+                        timings["influx"] += monotonic() - read_started
+                        break
+                    timings["influx"] += monotonic() - read_started
                     batch.append(record)
                     count += 1
                     records_read += 1
@@ -143,6 +172,7 @@ def backfill_influx(
                 window_seconds = min(window_seconds * 2, settings.influx_window_seconds)
                 continue
 
+            phase("finding_previous_point")
             report("finding_previous_point")
             previous = reader.previous_point_before(lower, cursor)
             if previous is None:
