@@ -51,10 +51,8 @@ def test_interface_run_routes_and_download(client, store):
     assert found["title"] == "Cosmic calibration"
     assert found["beamStatus"] == "unknown"
     assert found["experimentId"] == "unknown"
-    assert found["pointCount"] is None
-    stats = client.get(f"/api/v1/runs/stats?ids={found['id']}").json()["stats"][found["id"]]
-    assert stats["pointCount"] == 1
-    assert stats["estimatedJsonBytes"] > 0
+    assert found["endedAt"] == "2026-09-27T15:00:00Z"
+    assert "pointCount" not in found
     detail = client.get(f"/api/v1/runs/{found['id']}")
     assert detail.status_code == 200
     body = detail.json()
@@ -112,15 +110,31 @@ def test_run_list_checks_detector_only_for_visible_rows(client, store, monkeypat
         checked.append(start)
         return None
 
-    def expensive_count(start, end):
-        raise AssertionError("The run list must not count detector rows")
-
     monkeypatch.setattr(store, "influx_origin", origin)
-    monkeypatch.setattr(store, "detector_window_stats", expensive_count)
     response = client.get("/api/v1/runs?pageSize=5")
     assert response.status_code == 200
     assert response.json()["total"] == 20
     assert len(checked) == 5
+    assert client.get("/api/v1/runs/stats?ids=unknown").status_code == 404
+
+
+def test_diagnostics_coverage_includes_detector_and_legacy_points(client, store):
+    store.save(
+        SourceRecord(
+            "influx", "legacy", "old", {"_value": 1}, "2026-09-27T12:00:00Z", "80"
+        ),
+        {"_value": 1},
+    )
+    store.save_detector_batch(
+        [
+            SourceRecord(
+                "influx", "current", "new", {"_value": 2}, "2026-09-28T12:00:00Z", "80"
+            )
+        ]
+    )
+    influx = client.get("/api/v1/diagnostics").json()["sources"]["influx"]
+    assert influx["earliest"] == "2026-09-27T12:00:00Z"
+    assert influx["latest"] == "2026-09-28T12:00:00Z"
 
 
 def test_records_and_authentication(client, store):

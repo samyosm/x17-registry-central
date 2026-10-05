@@ -318,16 +318,30 @@ class RegistryStore:
                     "latest": row["latest"],
                     "lastSyncedAt": synced.get(name),
                 }
-            point_range = connection.execute(
-                "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
-                "FROM detector_points"
-            ).fetchone()
-            legacy_range = connection.execute(
-                "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
-                "FROM collected_records WHERE source='influx'"
-            ).fetchone()
-        starts = [value for value in (point_range["earliest"], legacy_range["earliest"]) if value]
-        ends = [value for value in (point_range["latest"], legacy_range["latest"]) if value]
+            point_range = (
+                connection.execute(
+                    "SELECT event_time FROM detector_points "
+                    "ORDER BY event_time ASC LIMIT 1"
+                ).fetchone(),
+                connection.execute(
+                    "SELECT event_time FROM detector_points "
+                    "ORDER BY event_time DESC LIMIT 1"
+                ).fetchone(),
+            )
+            legacy_range = (
+                connection.execute(
+                    "SELECT event_time FROM collected_records "
+                    "WHERE source='influx' AND event_time IS NOT NULL "
+                    "ORDER BY event_time ASC LIMIT 1"
+                ).fetchone(),
+                connection.execute(
+                    "SELECT event_time FROM collected_records "
+                    "WHERE source='influx' AND event_time IS NOT NULL "
+                    "ORDER BY event_time DESC LIMIT 1"
+                ).fetchone(),
+            )
+        starts = [row[0] for row in (point_range[0], legacy_range[0]) if row and row[0]]
+        ends = [row[0] for row in (point_range[1], legacy_range[1]) if row and row[0]]
         reverse_key = next(
             (key for key in checkpoints if key.startswith("influx-backfill-reverse:")), None
         )
@@ -441,45 +455,6 @@ class RegistryStore:
                 parameters,
             ).fetchone()
         return dict(row) if row is not None else None
-
-    def detector_window_stats(self, start: str, end: str | None) -> dict[str, int]:
-        condition, parameters = self._interval(start, end)
-        legacy_condition = (
-            "r.source='influx' AND "
-            + condition
-            + " AND NOT EXISTS (SELECT 1 FROM collected_records AS newer "
-            "WHERE newer.source=r.source AND newer.source_instance=r.source_instance "
-            "AND newer.source_id=r.source_id AND newer.revision>r.revision) "
-            "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
-            "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id)"
-        )
-        with closing(self.connect()) as connection:
-            point_count = connection.execute(
-                f"SELECT COUNT(*) FROM detector_points AS r WHERE {condition}", parameters
-            ).fetchone()[0]
-            legacy_count = connection.execute(
-                f"SELECT COUNT(*) FROM collected_records AS r WHERE {legacy_condition}", parameters
-            ).fetchone()[0]
-            samples = [
-                row[0]
-                for row in connection.execute(
-                    f"SELECT LENGTH(point_json) FROM detector_points AS r "
-                    f"WHERE {condition} LIMIT 32",
-                    parameters,
-                )
-            ]
-            legacy_samples = [
-                row[0]
-                for row in connection.execute(
-                    f"SELECT LENGTH(raw_json) FROM collected_records AS r "
-                    f"WHERE {legacy_condition} LIMIT 32",
-                    parameters,
-                )
-            ]
-        estimate = sum(samples) * point_count // len(samples) if samples else 0
-        if legacy_samples:
-            estimate += sum(legacy_samples) * legacy_count // len(legacy_samples)
-        return {"pointCount": point_count + legacy_count, "estimatedJsonBytes": estimate}
 
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, parameters = self._interval(start, end)

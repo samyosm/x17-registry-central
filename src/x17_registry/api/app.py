@@ -26,9 +26,9 @@ def run_id(source_instance: str, entry_id: str) -> str:
 
 def run_summary(
     record: dict[str, Any],
+    end: str | None,
     detector_origin: dict[str, str] | None,
     beam: dict[str, Any],
-    stats: dict[str, int] | None,
 ) -> dict[str, Any]:
     entry = record["raw"]
     return {
@@ -37,10 +37,9 @@ def run_summary(
         "experimentId": "unknown",
         "title": entry.get("title") or f"Trigger write {record['source_id']}",
         "startedAt": record["event_time"],
+        "endedAt": end,
         "beamStatus": beam["status"],
         "artifactCount": 2 if detector_origin is not None else 0,
-        "pointCount": stats["pointCount"] if stats else None,
-        "estimatedJsonBytes": stats["estimatedJsonBytes"] if stats else None,
     }
 
 
@@ -49,10 +48,9 @@ def run_detail(
     end: str | None,
     detector_origin: dict[str, str] | None,
     beam: dict[str, Any],
-    stats: dict[str, int] | None,
     prefix: str,
 ) -> dict[str, Any]:
-    summary = run_summary(record, detector_origin, beam, stats)
+    summary = run_summary(record, end, detector_origin, beam)
     entry = record["raw"]
     record_id = summary["id"]
     configuration = {
@@ -81,7 +79,6 @@ def run_detail(
     return {
         **summary,
         "titleSource": "TriggerApp history title",
-        "endedAt": end,
         "completeness": "partial",
         "detectorSources": [
             "VF48 / InfluxDB v2"
@@ -223,9 +220,9 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         for record, end in windows:
             summary = run_summary(
                 record,
+                end,
                 None,
                 beam_context(beam_events, record["event_time"], end),
-                None,
             )
             runs.append(summary)
             intervals[summary["id"]] = (record["event_time"], end)
@@ -263,22 +260,6 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "total": total,
             "page": page,
             "totalPages": max(1, (total + size - 1) // size),
-        }
-
-    @api.get("/runs/stats")
-    def run_stats(ids: Annotated[list[str], Query()]) -> dict[str, Any]:
-        if len(ids) > settings.max_page_size:
-            raise HTTPException(400, "Too many run IDs")
-        intervals = {
-            run_id(record["source_instance"], record["source_id"]): (record["event_time"], end)
-            for record, end in run_windows(registry)
-        }
-        return {
-            "stats": {
-                identity: registry.detector_window_stats(*intervals[identity])
-                for identity in dict.fromkeys(ids)
-                if identity in intervals
-            }
         }
 
     @api.get("/runs/suggestions")
@@ -332,7 +313,6 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             end,
             registry.influx_origin(record["event_time"], end),
             beam_context(registry.beam_events(), record["event_time"], end),
-            None,
             settings.api_prefix,
         )
 
