@@ -16,33 +16,57 @@ from x17_registry.adapters.registry import RegistryStore
 from x17_registry.config import Settings
 
 
-def run_id(source_instance: str, number: str) -> str:
+def run_id(source_instance: str, entry_id: str) -> str:
     digest = hashlib.sha256(source_instance.encode()).hexdigest()[:12]
-    return f"influx-{digest}-{number}"
+    return f"trigger-{digest}-{entry_id}"
 
 
-def run_summary(stat: dict[str, Any]) -> dict[str, Any]:
-    number = stat["run_number"]
+def run_summary(record: dict[str, Any], has_detector_data: bool) -> dict[str, Any]:
+    entry = record["raw"]
     return {
-        "id": run_id(stat["source_instance"], number),
-        "runNumber": number,
+        "id": run_id(record["source_instance"], record["source_id"]),
+        "runNumber": record["source_id"],
         "experimentId": "unknown",
-        "title": f"Run {number}",
-        "startedAt": stat["started_at"],
+        "title": entry.get("title") or f"Trigger write {record['source_id']}",
+        "startedAt": record["event_time"],
         "beamStatus": "unknown",
-        "artifactCount": 1,
+        "artifactCount": int(has_detector_data),
     }
 
 
-def run_detail(stat: dict[str, Any], prefix: str) -> dict[str, Any]:
-    summary = run_summary(stat)
+def run_detail(
+    record: dict[str, Any], end: str | None, has_detector_data: bool, prefix: str
+) -> dict[str, Any]:
+    summary = run_summary(record, has_detector_data)
+    entry = record["raw"]
     record_id = summary["id"]
+    configuration = {
+        "title": entry.get("title"),
+        "titleSource": "TriggerApp history title",
+        "triggerMode": entry.get("tmod"),
+        "majority": entry.get("maj"),
+        "channels": sorted((entry.get("thresholds") or {}).keys()),
+        "evidence": "Saved TriggerApp configuration; hardware readback unverified",
+    }
+    artifacts = []
+    if has_detector_data:
+        artifacts.append(
+            {
+                "id": "detector-records",
+                "name": f"{record_id}_detector.json",
+                "format": "JSON",
+                "source": "VF48 / InfluxDB",
+                "sizeBytes": None,
+                "state": "ready",
+                "downloadUrl": f"{prefix}/runs/{record_id}/artifacts/detector-records/download",
+            }
+        )
     return {
         **summary,
-        "titleSource": "InfluxDB measurement",
-        "endedAt": None,
+        "titleSource": "TriggerApp history title",
+        "endedAt": end,
         "completeness": "partial",
-        "detectorSources": ["VF48"],
+        "detectorSources": ["VF48"] if has_detector_data else [],
         "beam": {
             "status": "unknown",
             "source": "No verified run association",
@@ -51,31 +75,32 @@ def run_detail(stat: dict[str, Any], prefix: str) -> dict[str, Any]:
             "charge": None,
             "note": None,
         },
-        "configuration": None,
-        "notes": None,
-        "artifacts": [
-            {
-                "id": "detector-records",
-                "name": f"run_{stat['run_number']}_detector.json",
-                "format": "JSON",
-                "source": "VF48 / InfluxDB",
-                "sizeBytes": None,
-                "state": "ready",
-                "downloadUrl": f"{prefix}/runs/{record_id}/artifacts/detector-records/download",
-            }
-        ],
+        "configuration": configuration,
+        "notes": entry.get("note") or None,
+        "artifacts": artifacts,
     }
 
 
-def export_records(store: RegistryStore, source_instance: str, number: str) -> Iterator[bytes]:
+def export_records(store: RegistryStore, start: str, end: str | None) -> Iterator[bytes]:
     yield b"["
     first = True
-    for record in store.iter_run(source_instance, number):
+    for record in store.iter_interval(start, end):
         if not first:
             yield b","
         yield json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode()
         first = False
     yield b"]"
+
+
+def run_windows(store: RegistryStore) -> list[tuple[dict[str, Any], str | None]]:
+    records = store.trigger_runs()
+    next_start: dict[str, str] = {}
+    windows = []
+    for record in reversed(records):
+        source = record["source_instance"]
+        windows.append((record, next_start.get(source)))
+        next_start[source] = record["event_time"]
+    return windows
 
 
 def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAPI:
@@ -155,7 +180,10 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         if from_date and to_date and from_date > to_date:
             raise HTTPException(400, "from must be on or before to")
         size = min(page_size or settings.page_size, settings.max_page_size)
-        runs = [run_summary(stat) for stat in registry.run_stats()]
+        runs = [
+            run_summary(record, registry.has_influx_points(record["event_time"], end))
+            for record, end in run_windows(registry)
+        ]
         if q:
             term = q.casefold()
             runs = [
@@ -176,24 +204,32 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "totalPages": max(1, (total + size - 1) // size),
         }
 
-    def find_run(identity: str) -> dict[str, Any]:
-        for stat in registry.run_stats():
-            if run_id(stat["source_instance"], stat["run_number"]) == identity:
-                return stat
+    def find_run(identity: str) -> tuple[dict[str, Any], str | None]:
+        for record, end in run_windows(registry):
+            if run_id(record["source_instance"], record["source_id"]) == identity:
+                return record, end
         raise HTTPException(404, "Run not found")
 
     @api.get("/runs/{identity}")
     def get_run(identity: str) -> dict[str, Any]:
-        return run_detail(find_run(identity), settings.api_prefix)
+        record, end = find_run(identity)
+        return run_detail(
+            record,
+            end,
+            registry.has_influx_points(record["event_time"], end),
+            settings.api_prefix,
+        )
 
     @api.get("/runs/{identity}/artifacts/{artifact_id}/download")
     def download(identity: str, artifact_id: str) -> StreamingResponse:
-        stat = find_run(identity)
+        record, end = find_run(identity)
         if artifact_id != "detector-records":
             raise HTTPException(404, "Artifact not found")
-        filename = f"run_{stat['run_number']}_detector.json"
+        if not registry.has_influx_points(record["event_time"], end):
+            raise HTTPException(404, "Artifact not found")
+        filename = f"{identity}_detector.json"
         return StreamingResponse(
-            export_records(registry, stat["source_instance"], stat["run_number"]),
+            export_records(registry, record["event_time"], end),
             media_type="application/json",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )

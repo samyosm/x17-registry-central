@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS collected_records (
 CREATE INDEX IF NOT EXISTS collected_source
 ON collected_records(source, source_instance, source_id, revision);
 CREATE INDEX IF NOT EXISTS collected_run ON collected_records(source, run_number, event_time);
+CREATE INDEX IF NOT EXISTS collected_event_time ON collected_records(source, event_time);
 CREATE TABLE IF NOT EXISTS poll_checkpoints (
     source TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -207,6 +208,54 @@ class RegistryStore:
                 "SELECT source_instance,run_number,started_at,point_count FROM run_summaries"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def trigger_runs(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT r.* FROM collected_records AS r WHERE r.source='trigger_history' "
+                "AND r.event_time IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+                "AND newer.revision>r.revision) "
+                "ORDER BY r.event_time,r.source_instance,r.source_id"
+            ).fetchall()
+        return [self.document(row) for row in rows]
+
+    @staticmethod
+    def _interval(start: str, end: str | None) -> tuple[str, tuple[str, ...]]:
+        condition = "r.event_time>=?"
+        parameters: tuple[str, ...] = (start.removesuffix("Z"),)
+        if end is not None:
+            condition += " AND r.event_time<?"
+            parameters += (end.removesuffix("Z"),)
+        return condition, parameters
+
+    def has_influx_points(self, start: str, end: str | None) -> bool:
+        condition, parameters = self._interval(start, end)
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                f"SELECT 1 FROM collected_records AS r WHERE r.source='influx' "
+                f"AND {condition} AND NOT EXISTS ("
+                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+                "AND newer.revision>r.revision) LIMIT 1",
+                parameters,
+            ).fetchone()
+        return row is not None
+
+    def iter_interval(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
+        condition, parameters = self._interval(start, end)
+        with closing(self.connect()) as connection:
+            cursor = connection.execute(
+                "SELECT r.* FROM collected_records AS r WHERE r.source='influx' "
+                f"AND {condition} AND NOT EXISTS ("
+                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+                "AND newer.revision>r.revision) ORDER BY r.event_time,r.id",
+                parameters,
+            )
+            for row in cursor:
+                yield self.document(row)
 
     def iter_run(self, source_instance: str, run_number: str) -> Iterator[dict[str, Any]]:
         with closing(self.connect()) as connection:
