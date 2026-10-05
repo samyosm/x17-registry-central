@@ -62,6 +62,7 @@ def main() -> None:
             store,
             backfill_settings,
             backfill_settings.influx_backfill_min_window_seconds,
+            backfill_settings.influx_backfill_progress_seconds,
             lambda update: print(json.dumps(update), flush=True),
         )
         print(json.dumps(result))

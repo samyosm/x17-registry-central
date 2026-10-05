@@ -1,6 +1,7 @@
 import io
 from datetime import UTC, datetime, timedelta
 from http.client import IncompleteRead
+from threading import Event
 
 import pytest
 from conftest import poll_settings
@@ -11,23 +12,15 @@ from x17_registry.application.polling import SeekableInfluxReader, SourceRecord
 
 
 class SparseReader(SeekableInfluxReader):
-    def __init__(
-        self, event_times: list[datetime], window_seconds: int, overlap_seconds: int
-    ) -> None:
+    def __init__(self, event_times: list[datetime]) -> None:
         self.event_times = event_times
-        self.window_seconds = window_seconds
-        self.overlap_seconds = overlap_seconds
+        self.windows: list[tuple[datetime, datetime]] = []
 
     def read(self, checkpoint, now):
-        start = (
-            datetime.fromisoformat(checkpoint) - timedelta(seconds=self.overlap_seconds)
-            if checkpoint
-            else self.event_times[0] - timedelta(days=20)
-        )
-        stop = min(start + timedelta(seconds=self.window_seconds), now)
-        return self.read_window(start, stop), stop.isoformat()
+        raise NotImplementedError
 
     def read_window(self, start, stop):
+        self.windows.append((start, stop))
         return [
             SourceRecord(
                 "influx",
@@ -42,100 +35,111 @@ class SparseReader(SeekableInfluxReader):
         ]
 
     def next_point_at(self, start, stop):
-        return next((event for event in self.event_times if start <= event < stop), None)
+        raise NotImplementedError
+
+    def previous_point_before(self, start, stop):
+        return next((event for event in reversed(self.event_times) if start <= event < stop), None)
 
 
 class TruncatedReader(SparseReader):
     def read_window(self, start, stop):
+        records = super().read_window(start, stop)
         if (stop - start).total_seconds() > 10:
-            yield from super().read_window(start, stop)[:1]
+            yield from records[:1]
             raise IncompleteRead(b"")
-        yield from super().read_window(start, stop)
+        yield from records
 
 
-def test_backfill_skips_empty_years_and_keeps_checkpoint(store):
-    event_time = datetime.now(UTC) - timedelta(days=1)
+def settings_for(store, start):
+    return poll_settings(
+        store.path,
+        influx_enabled=True,
+        influx_url="http://example.invalid:8086",
+        influx_org="UdeM",
+        influx_bucket="vf48_test4",
+        influx_token="test-token",
+        influx_source_instance="test-influx",
+        influx_start_at=start,
+        influx_window_seconds=300,
+        influx_overlap_seconds=60,
+    )
+
+
+def test_reverse_backfill_starts_newest_and_skips_empty_years(store):
+    older = datetime(2025, 9, 19, 22, tzinfo=UTC)
+    newer = datetime.now(UTC) - timedelta(days=1)
     start = datetime(2016, 1, 29, 21, tzinfo=UTC)
-    store.set_checkpoint("influx", start.isoformat())
-    settings = poll_settings(
-        store.path,
-        influx_enabled=True,
-        influx_url="http://example.invalid:8086",
-        influx_org="UdeM",
-        influx_bucket="vf48_test4",
-        influx_token="test-token",
-        influx_source_instance="test-influx",
-        influx_start_at=start,
-        influx_window_seconds=300,
-        influx_overlap_seconds=60,
-    )
-    reader = SparseReader([event_time], 300, 60)
+    reader = SparseReader([older, newer])
     updates = []
-    result = backfill_influx(reader, store, settings, 1, updates.append)
 
-    assert result["skipped_gaps"] == 1
-    assert result["windows"] < 5
-    assert len(list(store.iter_interval(start.isoformat(), None))) == 1
-    assert store.checkpoint("influx") == result["checkpoint"]
-    assert any("skipped_to" in update for update in updates)
+    result = backfill_influx(reader, store, settings_for(store, start), 1, 10, updates.append)
 
-
-def test_backfill_imports_separate_periods_without_missing_points(store):
-    first = datetime.now(UTC) - timedelta(days=3)
-    second = first + timedelta(days=2)
-    settings = poll_settings(
-        store.path,
-        influx_enabled=True,
-        influx_url="http://example.invalid:8086",
-        influx_org="UdeM",
-        influx_bucket="vf48_test4",
-        influx_token="test-token",
-        influx_source_instance="test-influx",
-        influx_start_at=first - timedelta(days=20),
-        influx_window_seconds=300,
-        influx_overlap_seconds=60,
-    )
-    result = backfill_influx(
-        SparseReader([first, second], 300, 60), store, settings, 1, lambda _: None
-    )
     assert result["skipped_gaps"] == 2
-    assert len(list(store.iter_interval((first - timedelta(days=1)).isoformat(), None))) == 2
+    assert len(list(store.iter_interval(start.isoformat(), None))) == 2
+    assert reader.windows[0][1] > newer
+    assert reader.windows[0][0] > older
+    assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
+    assert store.checkpoint("influx") == store.checkpoint("influx-backfill-upper:test-influx")
+    assert {update["event"] for update in updates} >= {
+        "started",
+        "window_started",
+        "window_completed",
+        "skipped_gap",
+        "completed",
+    }
+    assert any(update["percent_time_scanned"] == 100 for update in updates)
 
 
-def test_backfill_retries_truncated_stream_in_smaller_windows(store):
+def test_reverse_backfill_retries_truncated_stream_without_duplicates(store):
     start = datetime.now(UTC) - timedelta(minutes=10)
-    event_times = [start + timedelta(seconds=1), start + timedelta(seconds=200)]
-    store.set_checkpoint("influx", start.isoformat())
-    settings = poll_settings(
-        store.path,
-        influx_enabled=True,
-        influx_url="http://example.invalid:8086",
-        influx_org="UdeM",
-        influx_bucket="vf48_test4",
-        influx_token="test-token",
-        influx_source_instance="test-influx",
-        influx_start_at=start,
-        influx_window_seconds=300,
-        influx_overlap_seconds=60,
-    )
+    events = [start + timedelta(seconds=1), start + timedelta(seconds=200)]
     updates = []
-    backfill_influx(TruncatedReader(event_times, 300, 60), store, settings, 1, updates.append)
-    assert any(update.get("window_seconds", 300) < 300 for update in updates)
+
+    backfill_influx(
+        TruncatedReader(events), store, settings_for(store, start), 1, 10, updates.append
+    )
+
+    assert any(update["event"] == "retry_smaller_window" for update in updates)
     assert len(list(store.iter_interval(start.isoformat(), None))) == 2
     assert store.run_stats()[0]["point_count"] == 2
 
 
-def test_next_point_query_returns_earliest_matching_time(monkeypatch, store):
-    settings = poll_settings(
-        store.path,
-        influx_enabled=True,
-        influx_url="http://example.invalid:8086",
-        influx_org="UdeM",
-        influx_bucket="vf48_test4",
-        influx_token="test-token",
-        influx_source_instance="test-influx",
-        influx_start_at=datetime(2016, 1, 1, tzinfo=UTC),
-    )
+def test_reverse_backfill_resumes_after_failure(store):
+    start = datetime.now(UTC) - timedelta(days=2)
+    event = start + timedelta(days=1)
+    settings = settings_for(store, start)
+
+    with pytest.raises(RuntimeError, match="reverse checkpoint remains"):
+        backfill_influx(TruncatedReader([event]), store, settings, 300, 10, lambda _: None)
+    upper = store.checkpoint("influx-backfill-upper:test-influx")
+    cursor = store.checkpoint("influx-backfill-reverse:test-influx")
+    assert upper == cursor
+
+    backfill_influx(SparseReader([event]), store, settings, 1, 10, lambda _: None)
+    assert store.checkpoint("influx-backfill-upper:test-influx") == upper
+    assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
+    assert len(list(store.iter_interval(start.isoformat(), None))) == 1
+
+
+def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    heartbeat_seen = Event()
+
+    class WaitingReader(SparseReader):
+        def read_window(self, start, stop):
+            assert heartbeat_seen.wait(1)
+            return super().read_window(start, stop)
+
+    def progress(update):
+        if update["event"] == "heartbeat":
+            heartbeat_seen.set()
+
+    backfill_influx(WaitingReader([]), store, settings_for(store, start), 1, 0.01, progress)
+    assert heartbeat_seen.is_set()
+
+
+def test_previous_point_query_uses_last_and_max(monkeypatch, store):
+    settings = settings_for(store, datetime(2016, 1, 1, tzinfo=UTC))
     response = (
         b"#group,false,false,true\n"
         b"#datatype,string,long,dateTime:RFC3339\n"
@@ -147,34 +151,25 @@ def test_next_point_query_returns_earliest_matching_time(monkeypatch, store):
     def fake_urlopen(request, timeout):
         query = request.data.decode()
         assert "range(start: 2016-01-01T00:00:00Z" in query
-        assert "first()" in query
-        assert 'min(column: "_time")' in query
+        assert "last()" in query
+        assert 'max(column: "_time")' in query
         assert timeout == settings.influx_timeout_seconds
         return io.BytesIO(response)
 
     monkeypatch.setattr("x17_registry.adapters.readers.urlopen", fake_urlopen)
-    found = InfluxReader(settings).next_point_at(
+    found = InfluxReader(settings).previous_point_before(
         datetime(2016, 1, 1, tzinfo=UTC), datetime(2026, 10, 1, tzinfo=UTC)
     )
     assert found == datetime(2026, 9, 29, 21, 0, 0, 599960, tzinfo=UTC)
 
 
-def test_next_point_query_rejects_unexpected_response(monkeypatch, store):
-    settings = poll_settings(
-        store.path,
-        influx_enabled=True,
-        influx_url="http://example.invalid:8086",
-        influx_org="UdeM",
-        influx_bucket="vf48_test4",
-        influx_token="test-token",
-        influx_source_instance="test-influx",
-        influx_start_at=datetime(2016, 1, 1, tzinfo=UTC),
-    )
+def test_point_time_query_rejects_unexpected_response(monkeypatch, store):
+    settings = settings_for(store, datetime(2016, 1, 1, tzinfo=UTC))
     monkeypatch.setattr(
         "x17_registry.adapters.readers.urlopen",
         lambda request, timeout: io.BytesIO(b",error\n,query failed\n"),
     )
     with pytest.raises(ValueError, match="no _time column"):
-        InfluxReader(settings).next_point_at(
+        InfluxReader(settings).previous_point_before(
             datetime(2016, 1, 1, tzinfo=UTC), datetime(2026, 10, 1, tzinfo=UTC)
         )

@@ -34,6 +34,10 @@ class SeekableInfluxReader(SourceReader, ABC):
     def next_point_at(self, start: datetime, stop: datetime) -> datetime | None:
         raise NotImplementedError
 
+    @abstractmethod
+    def previous_point_before(self, start: datetime, stop: datetime) -> datetime | None:
+        raise NotImplementedError
+
 
 class Processor(ABC):
     @abstractmethod

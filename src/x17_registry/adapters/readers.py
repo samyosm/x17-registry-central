@@ -202,6 +202,14 @@ class InfluxReader(SeekableInfluxReader):
                     )
 
     def next_point_at(self, start: datetime, stop: datetime) -> datetime | None:
+        return self._point_time(start, stop, "first", "min")
+
+    def previous_point_before(self, start: datetime, stop: datetime) -> datetime | None:
+        return self._point_time(start, stop, "last", "max")
+
+    def _point_time(
+        self, start: datetime, stop: datetime, selector: str, aggregate: str
+    ) -> datetime | None:
         settings = self.settings
         if settings.influx_bucket is None:
             raise ValueError("InfluxDB polling settings are incomplete.")
@@ -213,10 +221,10 @@ class InfluxReader(SeekableInfluxReader):
             f"from(bucket: {json.dumps(settings.influx_bucket)})\n"
             f"  |> range(start: {start_text}, stop: {stop_text})\n"
             "  |> filter(fn: (r) => r._measurement =~ /^run_[0-9]+$/)\n"
-            "  |> first()\n"
+            f"  |> {selector}()\n"
             '  |> keep(columns: ["_time"])\n'
             "  |> group(columns: [])\n"
-            '  |> min(column: "_time")'
+            f'  |> {aggregate}(column: "_time")'
         )
         with urlopen(self._request(query), timeout=settings.influx_timeout_seconds) as response:
             with io.TextIOWrapper(response, encoding="utf-8") as stream:
@@ -233,7 +241,7 @@ class InfluxReader(SeekableInfluxReader):
                         if timestamp:
                             return datetime.fromisoformat(utc_iso(timestamp).replace("Z", "+00:00"))
                     else:
-                        raise ValueError("InfluxDB next-point response has no _time column.")
+                        raise ValueError("InfluxDB point-time response has no _time column.")
         return None
 
     def _request(self, query: str) -> Request:
