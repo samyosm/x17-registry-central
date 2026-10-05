@@ -169,3 +169,102 @@ def test_download_formats_are_generated_from_new_detector_points(client, store):
     assert rows[0]["_value"] == "312"
     assert rows[0]["extra_json"] == '{"tag":"a,\\"b\\""}'
     assert store.records("influx", 1, 10)[1] == 0
+
+
+def test_beam_events_and_measurements_follow_trigger_windows(client, store):
+    for entry_id, at in (
+        ("first", "2026-09-27T14:00:00Z"),
+        ("second", "2026-09-27T15:00:00Z"),
+        ("third", "2026-09-27T16:00:00Z"),
+    ):
+        store.save(
+            SourceRecord(
+                "trigger_history",
+                "test-trigger",
+                entry_id,
+                {"id": entry_id, "timestamp": at, "title": entry_id},
+                at,
+            ),
+            {"title": entry_id},
+        )
+    for event_id, at, status, comment, active in (
+        (
+            1,
+            "2026-09-27T14:20:00Z",
+            "ON",
+            "Beam ON | Beam Energy E = 4.5 MeV | Current I = 3 nA"
+            " | Integrated Charge Q = 2 uC",
+            True,
+        ),
+        (2, "2026-09-27T14:40:00Z", "OFF", "Beam OFF", True),
+        (3, "2026-09-27T15:10:00Z", "ON", "Beam ON", False),
+    ):
+        store.save(
+            SourceRecord(
+                "logbook_event",
+                "test-logbook",
+                str(event_id),
+                {
+                    "id": event_id,
+                    "public_id": f"Run80_B{event_id}",
+                    "timestamp": at,
+                    "category": "Beam",
+                    "payload": {"status": status},
+                    "comment": comment,
+                    "is_active": active,
+                },
+                at,
+                "80",
+            ),
+            {"status": status},
+        )
+
+    runs = {run["title"]: run for run in client.get("/api/v1/runs").json()["runs"]}
+    assert runs["first"]["beamStatus"] == "on"
+    assert runs["second"]["beamStatus"] == "off"
+    assert runs["third"]["beamStatus"] == "off"
+    first = client.get(f"/api/v1/runs/{runs['first']['id']}").json()["beam"]
+    assert first["energy"] == "4.5 MeV"
+    assert first["current"] == "3 nA"
+    assert first["charge"] == "2 uC"
+    assert [event["status"] for event in first["events"]] == ["on", "off"]
+    second = client.get(f"/api/v1/runs/{runs['second']['id']}").json()["beam"]
+    assert second["energy"] is None
+    assert second["events"] == []
+
+
+def test_beam_session_spanning_run_boundary(client, store):
+    for entry_id, at in (
+        ("first", "2026-09-27T14:00:00Z"),
+        ("second", "2026-09-27T15:00:00Z"),
+    ):
+        store.save(
+            SourceRecord(
+                "trigger_history",
+                "test-trigger",
+                entry_id,
+                {"id": entry_id, "timestamp": at, "title": entry_id},
+                at,
+            ),
+            {},
+        )
+    first = client.get("/api/v1/runs?q=first").json()["runs"][0]
+    assert first["beamStatus"] == "unknown"
+    store.save(
+        SourceRecord(
+            "logbook_event",
+            "test-logbook",
+            "one",
+            {
+                "category": "Beam",
+                "payload": {"status": "ON"},
+                "comment": "Beam ON | Beam Energy E = 100 keV",
+                "is_active": True,
+            },
+            "2026-09-27T13:00:00Z",
+        ),
+        {},
+    )
+    assert client.get(f"/api/v1/runs/{first['id']}").json()["beam"]["energy"] == "100 keV"
+    second = client.get("/api/v1/runs?q=second").json()["runs"][0]
+    assert second["beamStatus"] == "on"

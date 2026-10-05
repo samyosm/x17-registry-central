@@ -330,6 +330,24 @@ class RegistryStore:
             ).fetchall()
         return [self.document(row) for row in rows]
 
+    def beam_events(self) -> list[dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT r.* FROM collected_records AS r WHERE r.source='logbook_event' "
+                "AND r.event_time IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+                "AND newer.revision>r.revision) ORDER BY r.event_time,r.id"
+            ).fetchall()
+        events = []
+        for row in rows:
+            record = self.document(row)
+            if record["raw"].get("category") == "Beam" and record["raw"].get(
+                "is_active", True
+            ):
+                events.append(record)
+        return events
+
     @staticmethod
     def _interval(start: str, end: str | None) -> tuple[str, tuple[str, ...]]:
         condition = "r.event_time>=?"

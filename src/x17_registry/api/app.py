@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from x17_registry.adapters.registry import RegistryStore
+from x17_registry.application.beam import beam_context
 from x17_registry.config import Settings
 
 
@@ -23,7 +24,9 @@ def run_id(source_instance: str, entry_id: str) -> str:
     return f"trigger-{digest}-{entry_id}"
 
 
-def run_summary(record: dict[str, Any], detector_origin: dict[str, str] | None) -> dict[str, Any]:
+def run_summary(
+    record: dict[str, Any], detector_origin: dict[str, str] | None, beam: dict[str, Any]
+) -> dict[str, Any]:
     entry = record["raw"]
     return {
         "id": run_id(record["source_instance"], record["source_id"]),
@@ -31,15 +34,19 @@ def run_summary(record: dict[str, Any], detector_origin: dict[str, str] | None) 
         "experimentId": "unknown",
         "title": entry.get("title") or f"Trigger write {record['source_id']}",
         "startedAt": record["event_time"],
-        "beamStatus": "unknown",
+        "beamStatus": beam["status"],
         "artifactCount": 2 if detector_origin is not None else 0,
     }
 
 
 def run_detail(
-    record: dict[str, Any], end: str | None, detector_origin: dict[str, str] | None, prefix: str
+    record: dict[str, Any],
+    end: str | None,
+    detector_origin: dict[str, str] | None,
+    beam: dict[str, Any],
+    prefix: str,
 ) -> dict[str, Any]:
-    summary = run_summary(record, detector_origin)
+    summary = run_summary(record, detector_origin, beam)
     entry = record["raw"]
     record_id = summary["id"]
     configuration = {
@@ -77,14 +84,7 @@ def run_detail(
         ]
         if detector_origin is not None
         else [],
-        "beam": {
-            "status": "unknown",
-            "source": "No verified run association",
-            "energy": None,
-            "current": None,
-            "charge": None,
-            "note": None,
-        },
+        "beam": beam,
         "configuration": configuration,
         "notes": entry.get("note") or None,
         "artifacts": artifacts,
@@ -208,8 +208,13 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         if from_date and to_date and from_date > to_date:
             raise HTTPException(400, "from must be on or before to")
         size = min(page_size or settings.page_size, settings.max_page_size)
+        beam_events = registry.beam_events()
         runs = [
-            run_summary(record, registry.influx_origin(record["event_time"], end))
+            run_summary(
+                record,
+                registry.influx_origin(record["event_time"], end),
+                beam_context(beam_events, record["event_time"], end),
+            )
             for record, end in run_windows(registry)
         ]
         if q:
@@ -245,6 +250,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             record,
             end,
             registry.influx_origin(record["event_time"], end),
+            beam_context(registry.beam_events(), record["event_time"], end),
             settings.api_prefix,
         )
 
