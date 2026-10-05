@@ -230,18 +230,19 @@ class RegistryStore:
             parameters += (end.removesuffix("Z"),)
         return condition, parameters
 
-    def has_influx_points(self, start: str, end: str | None) -> bool:
+    def influx_origin(self, start: str, end: str | None) -> dict[str, str] | None:
         condition, parameters = self._interval(start, end)
         with closing(self.connect()) as connection:
             row = connection.execute(
-                f"SELECT 1 FROM collected_records AS r WHERE r.source='influx' "
+                f"SELECT r.source_instance,r.run_number FROM collected_records AS r "
+                f"WHERE r.source='influx' "
                 f"AND {condition} AND NOT EXISTS ("
                 "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
                 "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
                 "AND newer.revision>r.revision) LIMIT 1",
                 parameters,
             ).fetchone()
-        return row is not None
+        return dict(row) if row is not None else None
 
     def iter_interval(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, parameters = self._interval(start, end)

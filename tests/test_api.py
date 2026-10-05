@@ -40,7 +40,9 @@ def test_interface_run_routes_and_download(client, store):
     body = detail.json()
     assert body["endedAt"] == "2026-09-27T15:00:00Z"
     assert body["configuration"]["majority"] == 2
+    assert body["detectorSources"] == ["VF48 / InfluxDB v2 / test-influx / run_80"]
     assert body["artifacts"][0]["state"] == "ready"
+    assert body["artifacts"][0]["source"] == "VF48 / InfluxDB v2 / test-influx"
     download = client.get(body["artifacts"][0]["downloadUrl"])
     assert download.status_code == 200
     assert [row["raw"]["_value"] for row in download.json()] == ["during"]

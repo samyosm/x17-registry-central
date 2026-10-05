@@ -21,7 +21,7 @@ def run_id(source_instance: str, entry_id: str) -> str:
     return f"trigger-{digest}-{entry_id}"
 
 
-def run_summary(record: dict[str, Any], has_detector_data: bool) -> dict[str, Any]:
+def run_summary(record: dict[str, Any], detector_origin: dict[str, str] | None) -> dict[str, Any]:
     entry = record["raw"]
     return {
         "id": run_id(record["source_instance"], record["source_id"]),
@@ -30,14 +30,14 @@ def run_summary(record: dict[str, Any], has_detector_data: bool) -> dict[str, An
         "title": entry.get("title") or f"Trigger write {record['source_id']}",
         "startedAt": record["event_time"],
         "beamStatus": "unknown",
-        "artifactCount": int(has_detector_data),
+        "artifactCount": int(detector_origin is not None),
     }
 
 
 def run_detail(
-    record: dict[str, Any], end: str | None, has_detector_data: bool, prefix: str
+    record: dict[str, Any], end: str | None, detector_origin: dict[str, str] | None, prefix: str
 ) -> dict[str, Any]:
-    summary = run_summary(record, has_detector_data)
+    summary = run_summary(record, detector_origin)
     entry = record["raw"]
     record_id = summary["id"]
     configuration = {
@@ -49,13 +49,13 @@ def run_detail(
         "evidence": "Saved TriggerApp configuration; hardware readback unverified",
     }
     artifacts = []
-    if has_detector_data:
+    if detector_origin is not None:
         artifacts.append(
             {
                 "id": "detector-records",
                 "name": f"{record_id}_detector.json",
                 "format": "JSON",
-                "source": "VF48 / InfluxDB",
+                "source": f"VF48 / InfluxDB v2 / {detector_origin['source_instance']}",
                 "sizeBytes": None,
                 "state": "ready",
                 "downloadUrl": f"{prefix}/runs/{record_id}/artifacts/detector-records/download",
@@ -66,7 +66,11 @@ def run_detail(
         "titleSource": "TriggerApp history title",
         "endedAt": end,
         "completeness": "partial",
-        "detectorSources": ["VF48"] if has_detector_data else [],
+        "detectorSources": [
+            "VF48 / InfluxDB v2"
+            f" / {detector_origin['source_instance']}"
+            f" / run_{detector_origin['run_number']}"
+        ] if detector_origin is not None else [],
         "beam": {
             "status": "unknown",
             "source": "No verified run association",
@@ -181,7 +185,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             raise HTTPException(400, "from must be on or before to")
         size = min(page_size or settings.page_size, settings.max_page_size)
         runs = [
-            run_summary(record, registry.has_influx_points(record["event_time"], end))
+            run_summary(record, registry.influx_origin(record["event_time"], end))
             for record, end in run_windows(registry)
         ]
         if q:
@@ -216,7 +220,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         return run_detail(
             record,
             end,
-            registry.has_influx_points(record["event_time"], end),
+            registry.influx_origin(record["event_time"], end),
             settings.api_prefix,
         )
 
@@ -225,7 +229,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         record, end = find_run(identity)
         if artifact_id != "detector-records":
             raise HTTPException(404, "Artifact not found")
-        if not registry.has_influx_points(record["event_time"], end):
+        if registry.influx_origin(record["event_time"], end) is None:
             raise HTTPException(404, "Artifact not found")
         filename = f"{identity}_detector.json"
         return StreamingResponse(
