@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.polling import SourceRecord
 
@@ -56,6 +58,86 @@ def test_rebuild_run_summaries_from_existing_records(store):
     ]
 
 
+def test_save_batch_deduplicates_and_updates_run_summary(store):
+    records = [
+        SourceRecord(
+            "influx",
+            "test-influx",
+            f"point-{index}",
+            {"_value": index},
+            f"2026-09-27T14:0{index}:00Z",
+            "80",
+        )
+        for index in range(3)
+    ]
+    batch = [(record, dict(record.raw)) for record in records]
+
+    assert store.save_batch(batch) == 3
+    assert store.save_batch(batch) == 0
+    assert store.save_batch([(records[0], {"_value": 0, "checked": True})]) == 1
+    assert store.run_stats()[0]["point_count"] == 3
+    assert store.records("influx", 1, 10)[1] == 3
+
+
+def test_save_batch_rolls_back_all_records_if_one_is_invalid(store):
+    valid = SourceRecord(
+        "influx", "test-influx", "valid", {"_value": 1}, "2026-09-27T14:00:00Z", "80"
+    )
+    invalid = SourceRecord(
+        "influx", "test-influx", "invalid", {"_value": float("nan")}, "2026-09-27T14:01:00Z", "80"
+    )
+
+    with pytest.raises(ValueError):
+        store.save_batch([(valid, dict(valid.raw)), (invalid, dict(invalid.raw))])
+
+    assert store.records("influx", 1, 10)[1] == 0
+    assert store.run_stats() == []
+
+
+def test_detector_points_have_one_copy_and_legacy_overlap_is_not_duplicated(store):
+    old = SourceRecord(
+        "influx",
+        "test-influx",
+        "point-1",
+        {"_time": "2026-09-27T14:00:00Z", "_value": "312"},
+        "2026-09-27T14:00:00Z",
+        "80",
+    )
+    new = SourceRecord(
+        "influx",
+        "test-influx",
+        "point-2",
+        {"_time": "2026-09-27T14:00:01Z", "_value": "313"},
+        "2026-09-27T14:00:01Z",
+        "80",
+    )
+    store.save(old, dict(old.raw))
+
+    assert store.save_detector_batch([old, new]) == 1
+    assert store.save_detector_batch([old, new]) == 0
+    assert store.records("influx", 1, 10)[1] == 1
+    assert [
+        point["_value"] for point in store.iter_detector_points("2026-09-27T14:00:00Z", None)
+    ] == ["312", "313"]
+    assert store.run_stats()[0]["point_count"] == 2
+    assert store.rebuild_run_summaries() == 1
+    assert store.run_stats()[0]["point_count"] == 2
+
+
+def test_detector_batch_rolls_back_on_invalid_point(store):
+    valid = SourceRecord(
+        "influx", "test-influx", "valid", {"_value": 1}, "2026-09-27T14:00:00Z", "80"
+    )
+    invalid = SourceRecord(
+        "influx", "test-influx", "invalid", {"_value": float("nan")}, "2026-09-27T14:00:01Z", "80"
+    )
+
+    with pytest.raises(ValueError):
+        store.save_detector_batch([valid, invalid])
+
+    assert list(store.iter_detector_points("2026-09-27T14:00:00Z", None)) == []
+
+
 def test_source_failure_does_not_block_other_sources(store):
     class BrokenReader:
         def read(self, checkpoint, now):
@@ -67,6 +149,6 @@ def test_source_failure_does_not_block_other_sources(store):
 
     from x17_registry.application.polling import IdentityProcessor, PollJob
 
-    job = PollJob({"bad": BrokenReader(), "good": GoodReader()}, IdentityProcessor(), store)
+    job = PollJob({"bad": BrokenReader(), "good": GoodReader()}, IdentityProcessor(), store, 1000)
     assert job.run_once() == {"bad": "error", "good": 1}
     assert store.records("trigger_config", 1, 10)[1] == 1

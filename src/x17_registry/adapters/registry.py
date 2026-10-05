@@ -1,7 +1,7 @@
 import hashlib
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     point_count INTEGER NOT NULL,
     PRIMARY KEY (source_instance, run_number)
 );
+CREATE TABLE IF NOT EXISTS detector_points (
+    source_instance TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    run_number TEXT NOT NULL,
+    point_json TEXT NOT NULL,
+    PRIMARY KEY (source_instance, source_id)
+);
+CREATE INDEX IF NOT EXISTS detector_point_time ON detector_points(event_time);
+CREATE INDEX IF NOT EXISTS detector_point_run
+ON detector_points(source_instance, run_number, event_time);
 """
 
 LATEST = """
@@ -70,38 +81,54 @@ class RegistryStore:
             connection.commit()
 
     def save(self, record: SourceRecord, processed: dict[str, Any]) -> bool:
-        raw_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
-        processed_json = json.dumps(processed, sort_keys=True, allow_nan=False)
-        digest = hashlib.sha256(f"{raw_json}\0{processed_json}".encode()).hexdigest()
-        key = (record.source, record.source_instance, record.source_id)
         with closing(self.connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            previous = connection.execute(
-                "SELECT revision, content_hash, event_time, run_number "
-                "FROM collected_records WHERE source=? "
-                "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
-                key,
-            ).fetchone()
-            if previous is not None and previous["content_hash"] == digest:
-                return False
-            revision = previous["revision"] + 1 if previous is not None else 1
-            connection.execute(
-                "INSERT INTO collected_records (source,source_instance,source_id,revision,"
-                "content_hash,event_time,run_number,raw_json,processed_json,collected_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (
-                    *key,
-                    revision,
-                    digest,
-                    record.event_time,
-                    record.run_number,
-                    raw_json,
-                    processed_json,
-                    datetime.now(UTC).isoformat(),
-                ),
-            )
-            if record.source == "influx" and record.run_number is not None:
-                if previous is None:
+            return self._save(connection, record, processed)
+
+    def save_batch(self, records: Iterable[tuple[SourceRecord, dict[str, Any]]]) -> int:
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return sum(self._save(connection, record, processed) for record, processed in records)
+
+    def save_detector_batch(self, records: Iterable[SourceRecord]) -> int:
+        saved = 0
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for record in records:
+                if (
+                    record.source != "influx"
+                    or record.event_time is None
+                    or record.run_number is None
+                ):
+                    raise ValueError("Detector batch requires complete Influx points.")
+                point_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
+                existing = connection.execute(
+                    "SELECT raw_json FROM collected_records WHERE source='influx' "
+                    "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
+                    (record.source_instance, record.source_id),
+                ).fetchone()
+                if existing is not None and existing["raw_json"] == point_json:
+                    continue
+                previous_point = connection.execute(
+                    "SELECT 1 FROM detector_points WHERE source_instance=? AND source_id=?",
+                    (record.source_instance, record.source_id),
+                ).fetchone()
+                cursor = connection.execute(
+                    "INSERT INTO detector_points "
+                    "(source_instance,source_id,event_time,run_number,point_json) "
+                    "VALUES(?,?,?,?,?) ON CONFLICT(source_instance,source_id) DO UPDATE SET "
+                    "event_time=excluded.event_time,run_number=excluded.run_number,"
+                    "point_json=excluded.point_json WHERE point_json<>excluded.point_json",
+                    (
+                        record.source_instance,
+                        record.source_id,
+                        record.event_time,
+                        record.run_number,
+                        point_json,
+                    ),
+                )
+                saved += cursor.rowcount
+                if cursor.rowcount and existing is None and previous_point is None:
                     connection.execute(
                         "INSERT INTO run_summaries "
                         "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
@@ -110,14 +137,57 @@ class RegistryStore:
                         "point_count=point_count+1",
                         (record.source_instance, record.run_number, record.event_time),
                     )
-                elif (
-                    previous["event_time"] != record.event_time
-                    or previous["run_number"] != record.run_number
-                ):
-                    self._refresh_run_summary(
-                        connection, record.source_instance, previous["run_number"]
-                    )
-                    self._refresh_run_summary(connection, record.source_instance, record.run_number)
+        return saved
+
+    def _save(
+        self, connection: sqlite3.Connection, record: SourceRecord, processed: dict[str, Any]
+    ) -> bool:
+        raw_json = json.dumps(record.raw, sort_keys=True, allow_nan=False)
+        processed_json = json.dumps(processed, sort_keys=True, allow_nan=False)
+        digest = hashlib.sha256(f"{raw_json}\0{processed_json}".encode()).hexdigest()
+        key = (record.source, record.source_instance, record.source_id)
+        previous = connection.execute(
+            "SELECT revision, content_hash, event_time, run_number "
+            "FROM collected_records WHERE source=? "
+            "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
+            key,
+        ).fetchone()
+        if previous is not None and previous["content_hash"] == digest:
+            return False
+        revision = previous["revision"] + 1 if previous is not None else 1
+        connection.execute(
+            "INSERT INTO collected_records (source,source_instance,source_id,revision,"
+            "content_hash,event_time,run_number,raw_json,processed_json,collected_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                *key,
+                revision,
+                digest,
+                record.event_time,
+                record.run_number,
+                raw_json,
+                processed_json,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        if record.source == "influx" and record.run_number is not None:
+            if previous is None:
+                connection.execute(
+                    "INSERT INTO run_summaries "
+                    "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
+                    "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
+                    "started_at=MIN(started_at,excluded.started_at), "
+                    "point_count=point_count+1",
+                    (record.source_instance, record.run_number, record.event_time),
+                )
+            elif (
+                previous["event_time"] != record.event_time
+                or previous["run_number"] != record.run_number
+            ):
+                self._refresh_run_summary(
+                    connection, record.source_instance, previous["run_number"]
+                )
+                self._refresh_run_summary(connection, record.source_instance, record.run_number)
         return True
 
     @staticmethod
@@ -148,13 +218,18 @@ class RegistryStore:
             connection.execute(
                 "INSERT INTO run_summaries "
                 "(source_instance,run_number,started_at,point_count) "
-                "SELECT r.source_instance,r.run_number,MIN(r.event_time),COUNT(*) "
+                "SELECT source_instance,run_number,MIN(event_time),COUNT(*) FROM ("
+                "SELECT r.source_instance,r.run_number,r.event_time "
                 "FROM collected_records AS r WHERE r.source='influx' "
                 "AND r.run_number IS NOT NULL AND NOT EXISTS ("
                 "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
                 "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
                 "AND newer.revision>r.revision) "
-                "GROUP BY r.source_instance,r.run_number"
+                "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
+                "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id) "
+                "UNION ALL "
+                "SELECT source_instance,run_number,event_time FROM detector_points) "
+                "GROUP BY source_instance,run_number"
             )
             return int(connection.execute("SELECT COUNT(*) FROM run_summaries").fetchone()[0])
 
@@ -233,6 +308,13 @@ class RegistryStore:
     def influx_origin(self, start: str, end: str | None) -> dict[str, str] | None:
         condition, parameters = self._interval(start, end)
         with closing(self.connect()) as connection:
+            point = connection.execute(
+                f"SELECT source_instance,run_number FROM detector_points AS r WHERE {condition} "
+                "LIMIT 1",
+                parameters,
+            ).fetchone()
+            if point is not None:
+                return dict(point)
             row = connection.execute(
                 f"SELECT r.source_instance,r.run_number FROM collected_records AS r "
                 f"WHERE r.source='influx' "
@@ -243,6 +325,26 @@ class RegistryStore:
                 parameters,
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
+        condition, parameters = self._interval(start, end)
+        with closing(self.connect()) as connection:
+            cursor = connection.execute(
+                "SELECT source_instance,source_id,event_time,point_json "
+                f"FROM detector_points AS r WHERE {condition} "
+                "UNION ALL "
+                "SELECT r.source_instance,r.source_id,r.event_time,r.raw_json AS point_json "
+                f"FROM collected_records AS r WHERE r.source='influx' AND {condition} "
+                "AND NOT EXISTS (SELECT 1 FROM collected_records AS newer "
+                "WHERE newer.source=r.source AND newer.source_instance=r.source_instance "
+                "AND newer.source_id=r.source_id AND newer.revision>r.revision) "
+                "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
+                "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id) "
+                "ORDER BY event_time",
+                (*parameters, *parameters),
+            )
+            for row in cursor:
+                yield json.loads(row["point_json"])
 
     def iter_interval(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, parameters = self._interval(start, end)

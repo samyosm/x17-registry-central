@@ -5,7 +5,7 @@ from threading import Event, Lock, Thread
 from time import monotonic
 
 from x17_registry.adapters.registry import RegistryStore
-from x17_registry.application.polling import IdentityProcessor, SeekableInfluxReader
+from x17_registry.application.polling import SeekableInfluxReader, SourceRecord
 from x17_registry.config import PollSettings
 
 STREAM_FAILURES = (IncompleteRead, RemoteDisconnected, ConnectionResetError, TimeoutError)
@@ -33,6 +33,7 @@ def backfill_influx(
     settings: PollSettings,
     min_window_seconds: float,
     progress_seconds: float,
+    batch_size: int,
     progress: Callable[[dict[str, object]], None],
 ) -> dict[str, int | str]:
     if settings.influx_start_at is None or settings.influx_source_instance is None:
@@ -41,6 +42,8 @@ def backfill_influx(
         raise ValueError("Backfill minimum window must be positive and at most the query window.")
     if progress_seconds <= 0:
         raise ValueError("Backfill progress interval must be positive.")
+    if batch_size <= 0:
+        raise ValueError("Backfill batch size must be positive.")
 
     lower = settings.influx_start_at.astimezone(UTC)
     cursor_key, upper_key = _checkpoint_keys(settings.influx_source_instance)
@@ -60,6 +63,7 @@ def backfill_influx(
         "cursor": cursor.isoformat(),
         "percent_time_scanned": _progress_percent(lower, upper, cursor),
         "window_records": 0,
+        "records_read": 0,
         "records_saved": 0,
     }
 
@@ -80,12 +84,19 @@ def backfill_influx(
 
     monitor = Thread(target=heartbeat, daemon=True)
     monitor.start()
-    processor = IdentityProcessor()
     window_seconds = float(settings.influx_window_seconds)
     windows = 0
     skipped = 0
     records_read = 0
     records_saved = 0
+
+    def flush(batch: list[SourceRecord]) -> None:
+        nonlocal records_saved
+        if batch:
+            records_saved += store.save_detector_batch(batch)
+            state["records_saved"] = records_saved
+            batch.clear()
+
     try:
         report("started", oldest_requested=lower.isoformat(), newest=upper.isoformat())
         while cursor > lower:
@@ -98,14 +109,17 @@ def backfill_influx(
             )
             report("window_started")
             count = 0
+            batch: list[SourceRecord] = []
             try:
                 for record in reader.read_window(start, cursor):
-                    if store.save(record, processor.process(record)):
-                        records_saved += 1
+                    batch.append(record)
                     count += 1
                     records_read += 1
                     state["window_records"] = count
-                    state["records_saved"] = records_saved
+                    state["records_read"] = records_read
+                    if len(batch) >= batch_size:
+                        flush(batch)
+                flush(batch)
             except STREAM_FAILURES as error:
                 if window_seconds <= min_window_seconds:
                     raise RuntimeError(

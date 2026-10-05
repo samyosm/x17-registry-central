@@ -38,6 +38,7 @@ def test_poll_stores_raw_and_processed_copies_without_duplicate_versions(store):
         {"trigger": TriggerReader(settings), "logbook": LogbookReader(settings)},
         IdentityProcessor(),
         store,
+        1000,
     )
     first = job.run_once()
     assert first == {"trigger": 202, "logbook": 28}
@@ -65,7 +66,7 @@ def test_old_logbook_row_edit_creates_revision(store, tmp_path: Path):
             ("Run4_B1", "2026-09-25 13:00:00", "Beam", '{"status":"ON"}', "", 1),
         )
     settings = poll_settings(store.path, logbook_database_path=source)
-    job = PollJob({"logbook": LogbookReader(settings)}, IdentityProcessor(), store)
+    job = PollJob({"logbook": LogbookReader(settings)}, IdentityProcessor(), store, 1000)
     assert job.run_once() == {"logbook": 1}
     with sqlite3.connect(source) as connection:
         connection.execute(

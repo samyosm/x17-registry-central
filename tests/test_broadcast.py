@@ -35,17 +35,18 @@ def test_influx_annotated_csv_and_checkpoint(monkeypatch, store):
         influx_source_instance="test-influx",
         influx_start_at=datetime(2026, 9, 27, 13, tzinfo=UTC),
     )
-    job = PollJob({"influx": InfluxReader(settings)}, IdentityProcessor(), store)
+    job = PollJob({"influx": InfluxReader(settings)}, IdentityProcessor(), store, 1)
     assert job.run_source("influx", datetime(2026, 9, 27, 15, tzinfo=UTC)) == 2
     assert store.checkpoint("influx") == "2026-09-27T14:00:00+00:00"
     assert requests[0].full_url.endswith("/api/v2/query?org=UdeM")
     assert requests[0].get_header("Authorization") == "Token local-test-token"
     assert b'from(bucket: "vf48_test4")' in requests[0].data
+    assert b'r._measurement == "run_80"' in requests[0].data
     assert job.run_source("influx", datetime(2026, 9, 27, 15, tzinfo=UTC)) == 2
-    records, count = store.records("influx", 1, 10)
-    assert count == 2
-    assert all(record["raw"] == record["processed"] for record in records)
-    assert {record["raw"]["_field"] for record in records} == {"trignum", "ADCA"}
+    records = list(store.iter_detector_points("2026-09-27T13:00:00Z", None))
+    assert len(records) == 2
+    assert {record["_field"] for record in records} == {"trignum", "ADCA"}
+    assert store.records("influx", 1, 10)[1] == 0
     assert store.run_stats()[0]["run_number"] == "80"
 
 
@@ -64,12 +65,11 @@ def test_malformed_influx_row_does_not_advance_checkpoint(monkeypatch, store):
         influx_source_instance="test-influx",
         influx_start_at=datetime(2026, 9, 27, 13, tzinfo=UTC),
     )
-    job = PollJob({"influx": InfluxReader(settings)}, IdentityProcessor(), store)
+    job = PollJob({"influx": InfluxReader(settings)}, IdentityProcessor(), store, 1)
     with pytest.raises(ValueError, match="VF48_num"):
         job.run_source("influx", datetime(2026, 9, 27, 15, tzinfo=UTC))
     assert store.checkpoint("influx") is None
-    _, count = store.records("influx", 1, 10)
-    assert count == 1
+    assert len(list(store.iter_detector_points("2026-09-27T13:00:00Z", None))) == 1
 
 
 def test_csv_parser_handles_repeated_tables():

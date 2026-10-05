@@ -22,7 +22,7 @@ def build_job(settings: PollSettings) -> PollJob:
     }
     if settings.influx_enabled:
         readers["influx"] = InfluxReader(settings)
-    return PollJob(readers, IdentityProcessor(), store)
+    return PollJob(readers, IdentityProcessor(), store, settings.influx_backfill_batch_size)
 
 
 def main() -> None:
@@ -63,6 +63,7 @@ def main() -> None:
             backfill_settings,
             backfill_settings.influx_backfill_min_window_seconds,
             backfill_settings.influx_backfill_progress_seconds,
+            backfill_settings.influx_backfill_batch_size,
             lambda update: print(json.dumps(update), flush=True),
         )
         print(json.dumps(result))

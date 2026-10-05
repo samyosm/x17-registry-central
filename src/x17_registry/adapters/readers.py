@@ -162,7 +162,11 @@ class InfluxReader(SeekableInfluxReader):
 
     def _query(self, start: datetime, stop: datetime) -> Iterator[SourceRecord]:
         settings = self.settings
-        if settings.influx_bucket is None or settings.influx_source_instance is None:
+        if (
+            settings.influx_bucket is None
+            or settings.influx_measurement is None
+            or settings.influx_source_instance is None
+        ):
             raise ValueError("InfluxDB polling settings are incomplete.")
         bucket = json.dumps(settings.influx_bucket)
         start_text = start.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -170,7 +174,7 @@ class InfluxReader(SeekableInfluxReader):
         query = (
             f"from(bucket: {bucket})\n"
             f"  |> range(start: {start_text}, stop: {stop_text})\n"
-            "  |> filter(fn: (r) => r._measurement =~ /^run_[0-9]+$/)"
+            f"  |> filter(fn: (r) => r._measurement == {json.dumps(settings.influx_measurement)})"
         )
         with urlopen(self._request(query), timeout=settings.influx_timeout_seconds) as response:
             with io.TextIOWrapper(response, encoding="utf-8") as stream:
@@ -211,7 +215,7 @@ class InfluxReader(SeekableInfluxReader):
         self, start: datetime, stop: datetime, selector: str, aggregate: str
     ) -> datetime | None:
         settings = self.settings
-        if settings.influx_bucket is None:
+        if settings.influx_bucket is None or settings.influx_measurement is None:
             raise ValueError("InfluxDB polling settings are incomplete.")
         if start >= stop:
             return None
@@ -220,7 +224,7 @@ class InfluxReader(SeekableInfluxReader):
         query = (
             f"from(bucket: {json.dumps(settings.influx_bucket)})\n"
             f"  |> range(start: {start_text}, stop: {stop_text})\n"
-            "  |> filter(fn: (r) => r._measurement =~ /^run_[0-9]+$/)\n"
+            f"  |> filter(fn: (r) => r._measurement == {json.dumps(settings.influx_measurement)})\n"
             f"  |> {selector}()\n"
             '  |> keep(columns: ["_time"])\n'
             "  |> group(columns: [])\n"

@@ -41,17 +41,20 @@ class PollSettings(CommonSettings):
     influx_url: str | None
     influx_org: str | None
     influx_bucket: str | None
+    influx_measurement: str | None = Field(pattern=r"^run_[0-9]+$")
     influx_token: SecretStr | None
     influx_source_instance: str | None
     influx_start_at: AwareDatetime | None
     influx_overlap_seconds: int = Field(ge=0)
     influx_window_seconds: int = Field(gt=0)
     influx_timeout_seconds: float = Field(gt=0)
+    influx_backfill_batch_size: int = Field(gt=0)
 
     @field_validator(
         "influx_url",
         "influx_org",
         "influx_bucket",
+        "influx_measurement",
         "influx_token",
         "influx_source_instance",
         "influx_start_at",
@@ -68,6 +71,7 @@ class PollSettings(CommonSettings):
                 self.influx_url,
                 self.influx_org,
                 self.influx_bucket,
+                self.influx_measurement,
                 self.influx_token,
                 self.influx_source_instance,
                 self.influx_start_at,

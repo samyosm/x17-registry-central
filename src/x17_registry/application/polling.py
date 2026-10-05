@@ -51,17 +51,33 @@ class IdentityProcessor(Processor):
 
 
 class PollJob:
-    def __init__(self, readers: dict[str, SourceReader], processor: Processor, store: Any) -> None:
+    def __init__(
+        self,
+        readers: dict[str, SourceReader],
+        processor: Processor,
+        store: Any,
+        detector_batch_size: int,
+    ) -> None:
         self.readers = readers
         self.processor = processor
         self.store = store
+        self.detector_batch_size = detector_batch_size
 
     def run_source(self, name: str, now: datetime) -> int:
         records, checkpoint = self.readers[name].read(self.store.checkpoint(name), now)
         count = 0
+        detector_batch: list[SourceRecord] = []
         for record in records:
-            self.store.save(record, self.processor.process(record))
+            if record.source == "influx":
+                detector_batch.append(record)
+                if len(detector_batch) >= self.detector_batch_size:
+                    self.store.save_detector_batch(detector_batch)
+                    detector_batch.clear()
+            else:
+                self.store.save(record, self.processor.process(record))
             count += 1
+        if detector_batch:
+            self.store.save_detector_batch(detector_batch)
         if checkpoint is not None:
             self.store.set_checkpoint(name, checkpoint)
         return count

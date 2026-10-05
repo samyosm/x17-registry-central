@@ -72,10 +72,10 @@ def test_reverse_backfill_starts_newest_and_skips_empty_years(store):
     reader = SparseReader([older, newer])
     updates = []
 
-    result = backfill_influx(reader, store, settings_for(store, start), 1, 10, updates.append)
+    result = backfill_influx(reader, store, settings_for(store, start), 1, 10, 2, updates.append)
 
     assert result["skipped_gaps"] == 2
-    assert len(list(store.iter_interval(start.isoformat(), None))) == 2
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
     assert reader.windows[0][1] > newer
     assert reader.windows[0][0] > older
     assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
@@ -96,11 +96,11 @@ def test_reverse_backfill_retries_truncated_stream_without_duplicates(store):
     updates = []
 
     backfill_influx(
-        TruncatedReader(events), store, settings_for(store, start), 1, 10, updates.append
+        TruncatedReader(events), store, settings_for(store, start), 1, 10, 2, updates.append
     )
 
     assert any(update["event"] == "retry_smaller_window" for update in updates)
-    assert len(list(store.iter_interval(start.isoformat(), None))) == 2
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 2
     assert store.run_stats()[0]["point_count"] == 2
 
 
@@ -110,15 +110,15 @@ def test_reverse_backfill_resumes_after_failure(store):
     settings = settings_for(store, start)
 
     with pytest.raises(RuntimeError, match="reverse checkpoint remains"):
-        backfill_influx(TruncatedReader([event]), store, settings, 300, 10, lambda _: None)
+        backfill_influx(TruncatedReader([event]), store, settings, 300, 10, 2, lambda _: None)
     upper = store.checkpoint("influx-backfill-upper:test-influx")
     cursor = store.checkpoint("influx-backfill-reverse:test-influx")
     assert upper == cursor
 
-    backfill_influx(SparseReader([event]), store, settings, 1, 10, lambda _: None)
+    backfill_influx(SparseReader([event]), store, settings, 1, 10, 2, lambda _: None)
     assert store.checkpoint("influx-backfill-upper:test-influx") == upper
     assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
-    assert len(list(store.iter_interval(start.isoformat(), None))) == 1
+    assert len(list(store.iter_detector_points(start.isoformat(), None))) == 1
 
 
 def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
@@ -134,7 +134,7 @@ def test_reverse_backfill_reports_heartbeat_during_slow_query(store):
         if update["event"] == "heartbeat":
             heartbeat_seen.set()
 
-    backfill_influx(WaitingReader([]), store, settings_for(store, start), 1, 0.01, progress)
+    backfill_influx(WaitingReader([]), store, settings_for(store, start), 1, 0.01, 2, progress)
     assert heartbeat_seen.is_set()
 
 
@@ -152,6 +152,7 @@ def test_previous_point_query_uses_last_and_max(monkeypatch, store):
         query = request.data.decode()
         assert "range(start: 2016-01-01T00:00:00Z" in query
         assert "last()" in query
+        assert 'r._measurement == "run_80"' in query
         assert 'max(column: "_time")' in query
         assert timeout == settings.influx_timeout_seconds
         return io.BytesIO(response)

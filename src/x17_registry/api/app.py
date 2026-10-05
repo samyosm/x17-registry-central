@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 import json
 import logging
 import secrets
@@ -30,7 +32,7 @@ def run_summary(record: dict[str, Any], detector_origin: dict[str, str] | None) 
         "title": entry.get("title") or f"Trigger write {record['source_id']}",
         "startedAt": record["event_time"],
         "beamStatus": "unknown",
-        "artifactCount": int(detector_origin is not None),
+        "artifactCount": 2 if detector_origin is not None else 0,
     }
 
 
@@ -50,17 +52,19 @@ def run_detail(
     }
     artifacts = []
     if detector_origin is not None:
-        artifacts.append(
-            {
-                "id": "detector-records",
-                "name": f"{record_id}_detector.json",
-                "format": "JSON",
-                "source": f"VF48 / InfluxDB v2 / {detector_origin['source_instance']}",
-                "sizeBytes": None,
-                "state": "ready",
-                "downloadUrl": f"{prefix}/runs/{record_id}/artifacts/detector-records/download",
-            }
-        )
+        for format_name in ("csv", "json"):
+            artifact_id = f"detector-records-{format_name}"
+            artifacts.append(
+                {
+                    "id": artifact_id,
+                    "name": f"{record_id}_detector.{format_name}",
+                    "format": format_name.upper(),
+                    "source": f"VF48 / InfluxDB v2 / {detector_origin['source_instance']}",
+                    "sizeBytes": None,
+                    "state": "ready",
+                    "downloadUrl": f"{prefix}/runs/{record_id}/artifacts/{artifact_id}/download",
+                }
+            )
     return {
         **summary,
         "titleSource": "TriggerApp history title",
@@ -87,15 +91,33 @@ def run_detail(
     }
 
 
-def export_records(store: RegistryStore, start: str, end: str | None) -> Iterator[bytes]:
+def export_json(store: RegistryStore, start: str, end: str | None) -> Iterator[bytes]:
     yield b"["
     first = True
-    for record in store.iter_interval(start, end):
+    for point in store.iter_detector_points(start, end):
         if not first:
             yield b","
-        yield json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode()
+        yield json.dumps(point, ensure_ascii=False, separators=(",", ":")).encode()
         first = False
     yield b"]"
+
+
+def export_csv(store: RegistryStore, start: str, end: str | None) -> Iterator[bytes]:
+    columns = ("_time", "_measurement", "VF48_num", "_field", "_value", "extra_json")
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns)
+    writer.writeheader()
+    yield buffer.getvalue().encode()
+    buffer.seek(0)
+    buffer.truncate(0)
+    for point in store.iter_detector_points(start, end):
+        row = {key: point.get(key, "") for key in columns if key != "extra_json"}
+        extra = {key: value for key, value in point.items() if key not in columns}
+        row["extra_json"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+        writer.writerow(row)
+        yield buffer.getvalue().encode()
+        buffer.seek(0)
+        buffer.truncate(0)
 
 
 def run_windows(store: RegistryStore) -> list[tuple[dict[str, Any], str | None]]:
@@ -229,14 +251,21 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
     @api.get("/runs/{identity}/artifacts/{artifact_id}/download")
     def download(identity: str, artifact_id: str) -> StreamingResponse:
         record, end = find_run(identity)
-        if artifact_id != "detector-records":
+        if artifact_id not in ("detector-records", "detector-records-csv", "detector-records-json"):
             raise HTTPException(404, "Artifact not found")
         if registry.influx_origin(record["event_time"], end) is None:
             raise HTTPException(404, "Artifact not found")
-        filename = f"{identity}_detector.json"
+        format_name = (
+            "json"
+            if artifact_id == "detector-records"
+            else artifact_id.removeprefix("detector-records-")
+        )
+        filename = f"{identity}_detector.{format_name}"
         return StreamingResponse(
-            export_records(registry, record["event_time"], end),
-            media_type="application/json",
+            export_csv(registry, record["event_time"], end)
+            if format_name == "csv"
+            else export_json(registry, record["event_time"], end),
+            media_type="text/csv" if format_name == "csv" else "application/json",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
 

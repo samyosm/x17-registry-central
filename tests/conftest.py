@@ -42,12 +42,14 @@ def poll_settings(database_path: Path, **overrides) -> PollSettings:
         "influx_url": None,
         "influx_org": None,
         "influx_bucket": None,
+        "influx_measurement": "run_80",
         "influx_token": None,
         "influx_source_instance": None,
         "influx_start_at": None,
         "influx_overlap_seconds": 60,
         "influx_window_seconds": 3600,
         "influx_timeout_seconds": 5,
+        "influx_backfill_batch_size": 1000,
     }
     values.update(overrides)
     return PollSettings(_env_file=None, **values)
