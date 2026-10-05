@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 from collections.abc import AsyncIterator, Iterator
@@ -101,6 +102,9 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
 
     @app.exception_handler(sqlite3.Error)
     async def storage_error(request: Request, error: sqlite3.Error) -> JSONResponse:
+        logging.getLogger(__name__).error(
+            "Registry SQLite error", exc_info=(type(error), error, error.__traceback__)
+        )
         return JSONResponse(
             status_code=503,
             content={

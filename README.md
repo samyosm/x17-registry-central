@@ -11,4 +11,6 @@ The example paths point to the copied TriggerApp JSON and logbook SQLite files. 
 
 The API uses `Authorization: Bearer <X17_API_TOKEN>`. Its routes and schemas are available at `http://127.0.0.1:8000/docs` with the example bind settings.
 
+After upgrading a registry database created before run summaries existed, stop the API and poller, run `uv run x17-registry rebuild-run-summaries` once, then restart them. This updates only the registry database.
+
 Run `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`, and `uv run mypy` for checks.

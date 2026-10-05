@@ -24,6 +24,36 @@ def test_registry_survives_restart_with_raw_processed_and_checkpoint(store):
     assert not reopened.save(record, dict(record.raw))
     assert reopened.save(record, {**record.raw, "checked": True})
     assert reopened.records("influx", 1, 10)[0][0]["revision"] == 2
+    assert reopened.run_stats() == [
+        {
+            "source_instance": "test-influx",
+            "run_number": "80",
+            "started_at": "2026-09-27T14:00:00Z",
+            "point_count": 1,
+        }
+    ]
+
+
+def test_rebuild_run_summaries_from_existing_records(store):
+    for identity, event_time in (
+        ("point-1", "2026-09-27T14:00:00Z"),
+        ("point-2", "2026-09-27T14:01:00Z"),
+    ):
+        record = SourceRecord(
+            "influx", "test-influx", identity, {"_value": identity}, event_time, "80"
+        )
+        store.save(record, dict(record.raw))
+    with store.connect() as connection:
+        connection.execute("DELETE FROM run_summaries")
+    assert store.rebuild_run_summaries() == 1
+    assert store.run_stats() == [
+        {
+            "source_instance": "test-influx",
+            "run_number": "80",
+            "started_at": "2026-09-27T14:00:00Z",
+            "point_count": 2,
+        }
+    ]
 
 
 def test_source_failure_does_not_block_other_sources(store):

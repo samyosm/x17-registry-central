@@ -9,7 +9,7 @@ from x17_registry.adapters.readers import InfluxReader, LogbookReader, TriggerRe
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.api.app import create_app
 from x17_registry.application.polling import IdentityProcessor, PollJob, SourceReader
-from x17_registry.config import PollSettings, Settings
+from x17_registry.config import CommonSettings, PollSettings, Settings
 
 
 def build_job(settings: PollSettings) -> PollJob:
@@ -26,7 +26,7 @@ def build_job(settings: PollSettings) -> PollJob:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="X17 registry service")
-    parser.add_argument("command", choices=("serve", "poll", "poll-once"))
+    parser.add_argument("command", choices=("serve", "poll", "poll-once", "rebuild-run-summaries"))
     command = parser.parse_args().command
     if command == "serve":
         settings = Settings()
@@ -37,6 +37,12 @@ def main() -> None:
             port=settings.port,
             log_level=settings.log_level,
         )
+        return
+    if command == "rebuild-run-summaries":
+        common_settings = CommonSettings()
+        store = RegistryStore(common_settings.database_path, common_settings.sqlite_timeout_seconds)
+        store.initialize()
+        print(json.dumps({"runs": store.rebuild_run_summaries()}))
         return
     poll_settings = PollSettings()
     logging.basicConfig(level=poll_settings.log_level.upper())

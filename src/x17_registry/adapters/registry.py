@@ -31,6 +31,13 @@ CREATE TABLE IF NOT EXISTS poll_checkpoints (
     source TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS run_summaries (
+    source_instance TEXT NOT NULL,
+    run_number TEXT NOT NULL,
+    started_at TEXT,
+    point_count INTEGER NOT NULL,
+    PRIMARY KEY (source_instance, run_number)
+);
 """
 
 LATEST = """
@@ -69,7 +76,8 @@ class RegistryStore:
         with closing(self.connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             previous = connection.execute(
-                "SELECT revision, content_hash FROM collected_records WHERE source=? "
+                "SELECT revision, content_hash, event_time, run_number "
+                "FROM collected_records WHERE source=? "
                 "AND source_instance=? AND source_id=? ORDER BY revision DESC LIMIT 1",
                 key,
             ).fetchone()
@@ -91,7 +99,63 @@ class RegistryStore:
                     datetime.now(UTC).isoformat(),
                 ),
             )
+            if record.source == "influx" and record.run_number is not None:
+                if previous is None:
+                    connection.execute(
+                        "INSERT INTO run_summaries "
+                        "(source_instance,run_number,started_at,point_count) VALUES(?,?,?,1) "
+                        "ON CONFLICT(source_instance,run_number) DO UPDATE SET "
+                        "started_at=MIN(started_at,excluded.started_at), "
+                        "point_count=point_count+1",
+                        (record.source_instance, record.run_number, record.event_time),
+                    )
+                elif (
+                    previous["event_time"] != record.event_time
+                    or previous["run_number"] != record.run_number
+                ):
+                    self._refresh_run_summary(
+                        connection, record.source_instance, previous["run_number"]
+                    )
+                    self._refresh_run_summary(connection, record.source_instance, record.run_number)
         return True
+
+    @staticmethod
+    def _refresh_run_summary(
+        connection: sqlite3.Connection, source_instance: str, run_number: str | None
+    ) -> None:
+        if run_number is None:
+            return
+        connection.execute(
+            "DELETE FROM run_summaries WHERE source_instance=? AND run_number=?",
+            (source_instance, run_number),
+        )
+        connection.execute(
+            "INSERT INTO run_summaries (source_instance,run_number,started_at,point_count) "
+            "SELECT source_instance,run_number,MIN(event_time),COUNT(*) "
+            "FROM collected_records AS r WHERE source='influx' AND source_instance=? "
+            "AND run_number=? AND NOT EXISTS ("
+            "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+            "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+            "AND newer.revision>r.revision) GROUP BY source_instance,run_number",
+            (source_instance, run_number),
+        )
+
+    def rebuild_run_summaries(self) -> int:
+        with closing(self.connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM run_summaries")
+            connection.execute(
+                "INSERT INTO run_summaries "
+                "(source_instance,run_number,started_at,point_count) "
+                "SELECT r.source_instance,r.run_number,MIN(r.event_time),COUNT(*) "
+                "FROM collected_records AS r WHERE r.source='influx' "
+                "AND r.run_number IS NOT NULL AND NOT EXISTS ("
+                "SELECT 1 FROM collected_records AS newer WHERE newer.source=r.source "
+                "AND newer.source_instance=r.source_instance AND newer.source_id=r.source_id "
+                "AND newer.revision>r.revision) "
+                "GROUP BY r.source_instance,r.run_number"
+            )
+            return int(connection.execute("SELECT COUNT(*) FROM run_summaries").fetchone()[0])
 
     def checkpoint(self, source: str) -> str | None:
         with closing(self.connect()) as connection:
@@ -140,10 +204,7 @@ class RegistryStore:
     def run_stats(self) -> list[dict[str, Any]]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                f"SELECT r.source_instance, r.run_number, MIN(r.event_time) AS started_at, "
-                "COUNT(*) AS point_count "
-                f"FROM ({LATEST}) r WHERE r.source='influx' AND r.run_number IS NOT NULL "
-                "GROUP BY r.source_instance, r.run_number"
+                "SELECT source_instance,run_number,started_at,point_count FROM run_summaries"
             ).fetchall()
         return [dict(row) for row in rows]
 
