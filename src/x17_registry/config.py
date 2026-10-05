@@ -84,3 +84,7 @@ class PollSettings(CommonSettings):
         if self.influx_overlap_seconds >= self.influx_window_seconds:
             raise ValueError("Influx overlap must be shorter than its polling window.")
         return self
+
+
+class BackfillSettings(PollSettings):
+    influx_backfill_min_window_seconds: float = Field(gt=0)

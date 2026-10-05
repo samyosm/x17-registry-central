@@ -10,7 +10,7 @@ from x17_registry.adapters.registry import RegistryStore
 from x17_registry.api.app import create_app
 from x17_registry.application.backfill import backfill_influx
 from x17_registry.application.polling import IdentityProcessor, PollJob, SourceReader
-from x17_registry.config import CommonSettings, PollSettings, Settings
+from x17_registry.config import BackfillSettings, CommonSettings, PollSettings, Settings
 
 
 def build_job(settings: PollSettings) -> PollJob:
@@ -48,21 +48,26 @@ def main() -> None:
         store.initialize()
         print(json.dumps({"runs": store.rebuild_run_summaries()}))
         return
-    poll_settings = PollSettings()
-    logging.basicConfig(level=poll_settings.log_level.upper())
     if command == "backfill-influx":
-        if not poll_settings.influx_enabled:
+        backfill_settings = BackfillSettings()
+        logging.basicConfig(level=backfill_settings.log_level.upper())
+        if not backfill_settings.influx_enabled:
             raise SystemExit("X17_INFLUX_ENABLED must be true for backfill.")
-        store = RegistryStore(poll_settings.database_path, poll_settings.sqlite_timeout_seconds)
+        store = RegistryStore(
+            backfill_settings.database_path, backfill_settings.sqlite_timeout_seconds
+        )
         store.initialize()
         result = backfill_influx(
-            InfluxReader(poll_settings),
+            InfluxReader(backfill_settings),
             store,
-            poll_settings,
+            backfill_settings,
+            backfill_settings.influx_backfill_min_window_seconds,
             lambda update: print(json.dumps(update), flush=True),
         )
         print(json.dumps(result))
         return
+    poll_settings = PollSettings()
+    logging.basicConfig(level=poll_settings.log_level.upper())
     job = build_job(poll_settings)
     if command == "poll-once":
         result = job.run_once()

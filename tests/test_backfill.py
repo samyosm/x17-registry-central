@@ -1,5 +1,6 @@
 import io
 from datetime import UTC, datetime, timedelta
+from http.client import IncompleteRead
 
 import pytest
 from conftest import poll_settings
@@ -24,7 +25,10 @@ class SparseReader(SeekableInfluxReader):
             else self.event_times[0] - timedelta(days=20)
         )
         stop = min(start + timedelta(seconds=self.window_seconds), now)
-        records = [
+        return self.read_window(start, stop), stop.isoformat()
+
+    def read_window(self, start, stop):
+        return [
             SourceRecord(
                 "influx",
                 "test-influx",
@@ -36,10 +40,17 @@ class SparseReader(SeekableInfluxReader):
             for index, event_time in enumerate(self.event_times)
             if start <= event_time < stop
         ]
-        return records, stop.isoformat()
 
     def next_point_at(self, start, stop):
         return next((event for event in self.event_times if start <= event < stop), None)
+
+
+class TruncatedReader(SparseReader):
+    def read_window(self, start, stop):
+        if (stop - start).total_seconds() > 10:
+            yield from super().read_window(start, stop)[:1]
+            raise IncompleteRead(b"")
+        yield from super().read_window(start, stop)
 
 
 def test_backfill_skips_empty_years_and_keeps_checkpoint(store):
@@ -60,7 +71,7 @@ def test_backfill_skips_empty_years_and_keeps_checkpoint(store):
     )
     reader = SparseReader([event_time], 300, 60)
     updates = []
-    result = backfill_influx(reader, store, settings, updates.append)
+    result = backfill_influx(reader, store, settings, 1, updates.append)
 
     assert result["skipped_gaps"] == 1
     assert result["windows"] < 5
@@ -85,10 +96,33 @@ def test_backfill_imports_separate_periods_without_missing_points(store):
         influx_overlap_seconds=60,
     )
     result = backfill_influx(
-        SparseReader([first, second], 300, 60), store, settings, lambda _: None
+        SparseReader([first, second], 300, 60), store, settings, 1, lambda _: None
     )
     assert result["skipped_gaps"] == 2
     assert len(list(store.iter_interval((first - timedelta(days=1)).isoformat(), None))) == 2
+
+
+def test_backfill_retries_truncated_stream_in_smaller_windows(store):
+    start = datetime.now(UTC) - timedelta(minutes=10)
+    event_times = [start + timedelta(seconds=1), start + timedelta(seconds=200)]
+    store.set_checkpoint("influx", start.isoformat())
+    settings = poll_settings(
+        store.path,
+        influx_enabled=True,
+        influx_url="http://example.invalid:8086",
+        influx_org="UdeM",
+        influx_bucket="vf48_test4",
+        influx_token="test-token",
+        influx_source_instance="test-influx",
+        influx_start_at=start,
+        influx_window_seconds=300,
+        influx_overlap_seconds=60,
+    )
+    updates = []
+    backfill_influx(TruncatedReader(event_times, 300, 60), store, settings, 1, updates.append)
+    assert any(update.get("window_seconds", 300) < 300 for update in updates)
+    assert len(list(store.iter_interval(start.isoformat(), None))) == 2
+    assert store.run_stats()[0]["point_count"] == 2
 
 
 def test_next_point_query_returns_earliest_matching_time(monkeypatch, store):

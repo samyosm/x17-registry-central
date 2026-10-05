@@ -27,6 +27,10 @@ class SourceReader(ABC):
 
 class SeekableInfluxReader(SourceReader, ABC):
     @abstractmethod
+    def read_window(self, start: datetime, stop: datetime) -> Iterable[SourceRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
     def next_point_at(self, start: datetime, stop: datetime) -> datetime | None:
         raise NotImplementedError
 

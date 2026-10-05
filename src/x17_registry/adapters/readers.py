@@ -155,7 +155,10 @@ class InfluxReader(SeekableInfluxReader):
         stop = min(start + timedelta(seconds=settings.influx_window_seconds), now)
         if start >= stop:
             return (), None
-        return self._query(start, stop), stop.astimezone(UTC).isoformat()
+        return self.read_window(start, stop), stop.astimezone(UTC).isoformat()
+
+    def read_window(self, start: datetime, stop: datetime) -> Iterator[SourceRecord]:
+        return self._query(start, stop)
 
     def _query(self, start: datetime, stop: datetime) -> Iterator[SourceRecord]:
         settings = self.settings
