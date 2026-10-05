@@ -198,3 +198,7 @@ def test_source_failure_does_not_block_other_sources(store):
     job = PollJob({"bad": BrokenReader(), "good": GoodReader()}, IdentityProcessor(), store, 1000)
     assert job.run_once() == {"bad": "error", "good": 1}
     assert store.records("trigger_config", 1, 10)[1] == 1
+    with store.connect() as connection:
+        synced = dict(connection.execute("SELECT source,last_success_at FROM source_sync"))
+    assert "bad" not in synced
+    assert "good" in synced

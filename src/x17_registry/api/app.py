@@ -25,7 +25,10 @@ def run_id(source_instance: str, entry_id: str) -> str:
 
 
 def run_summary(
-    record: dict[str, Any], detector_origin: dict[str, str] | None, beam: dict[str, Any]
+    record: dict[str, Any],
+    detector_origin: dict[str, str] | None,
+    beam: dict[str, Any],
+    stats: dict[str, int] | None,
 ) -> dict[str, Any]:
     entry = record["raw"]
     return {
@@ -36,6 +39,8 @@ def run_summary(
         "startedAt": record["event_time"],
         "beamStatus": beam["status"],
         "artifactCount": 2 if detector_origin is not None else 0,
+        "pointCount": stats["pointCount"] if stats else None,
+        "estimatedJsonBytes": stats["estimatedJsonBytes"] if stats else None,
     }
 
 
@@ -44,9 +49,10 @@ def run_detail(
     end: str | None,
     detector_origin: dict[str, str] | None,
     beam: dict[str, Any],
+    stats: dict[str, int],
     prefix: str,
 ) -> dict[str, Any]:
-    summary = run_summary(record, detector_origin, beam)
+    summary = run_summary(record, detector_origin, beam, stats)
     entry = record["raw"]
     record_id = summary["id"]
     configuration = {
@@ -201,6 +207,8 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         q: str | None = None,
         from_date: Annotated[date | None, Query(alias="from")] = None,
         to_date: Annotated[date | None, Query(alias="to")] = None,
+        beam: Literal["on", "off", "unknown"] | None = None,
+        has_data: Annotated[bool | None, Query(alias="hasData")] = None,
         sort: Literal["newest", "oldest"] = "newest",
         page: int = Query(1, ge=1),
         page_size: int | None = Query(None, alias="pageSize", ge=1),
@@ -209,14 +217,19 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             raise HTTPException(400, "from must be on or before to")
         size = min(page_size or settings.page_size, settings.max_page_size)
         beam_events = registry.beam_events()
-        runs = [
-            run_summary(
+        windows = run_windows(registry)
+        runs = []
+        intervals = {}
+        for record, end in windows:
+            origin = registry.influx_origin(record["event_time"], end)
+            summary = run_summary(
                 record,
-                registry.influx_origin(record["event_time"], end),
+                origin,
                 beam_context(beam_events, record["event_time"], end),
+                None,
             )
-            for record, end in run_windows(registry)
-        ]
+            runs.append(summary)
+            intervals[summary["id"]] = (record["event_time"], end)
         if q:
             term = q.casefold()
             runs = [
@@ -228,13 +241,58 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             runs = [run for run in runs if run["startedAt"][:10] >= from_date.isoformat()]
         if to_date:
             runs = [run for run in runs if run["startedAt"][:10] <= to_date.isoformat()]
+        if beam:
+            runs = [run for run in runs if run["beamStatus"] == beam]
+        if has_data is not None:
+            runs = [run for run in runs if (run["artifactCount"] > 0) == has_data]
         runs.sort(key=lambda run: (run["startedAt"], run["id"]), reverse=sort == "newest")
         total = len(runs)
+        page_runs = runs[(page - 1) * size : page * size]
+        for run in page_runs:
+            start, end = intervals[run["id"]]
+            run.update(registry.detector_window_stats(start, end))
         return {
-            "runs": runs[(page - 1) * size : page * size],
+            "runs": page_runs,
             "total": total,
             "page": page,
             "totalPages": max(1, (total + size - 1) // size),
+        }
+
+    @api.get("/runs/suggestions")
+    def suggest_runs(q: str = Query(min_length=1, max_length=200)) -> dict[str, Any]:
+        term = q.casefold().strip()
+        matches = []
+        for record in reversed(registry.trigger_runs()):
+            title = record["raw"].get("title") or ""
+            identity = run_id(record["source_instance"], record["source_id"])
+            if term in f"{identity} {record['source_id']} {title}".casefold():
+                matches.append({"id": identity, "title": title, "startedAt": record["event_time"]})
+            if len(matches) == 8:
+                break
+        return {"suggestions": matches}
+
+    @api.get("/diagnostics")
+    def diagnostics() -> dict[str, Any]:
+        return {
+            "sources": registry.source_status(),
+            "runStarts": [
+                {
+                    "at": record["event_time"],
+                    "id": run_id(record["source_instance"], record["source_id"]),
+                    "title": record["raw"].get("title") or "",
+                }
+                for record in registry.trigger_runs()
+            ],
+            "beamChanges": [
+                {
+                    "at": record["event_time"],
+                    "status": record["raw"].get("payload", {}).get("status"),
+                    "publicId": record["raw"].get("public_id"),
+                }
+                for record in registry.beam_events()
+                if isinstance(record["raw"].get("payload"), dict)
+                and record["raw"]["payload"].get("status") in ("ON", "OFF")
+            ],
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:
@@ -251,6 +309,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             end,
             registry.influx_origin(record["event_time"], end),
             beam_context(registry.beam_events(), record["event_time"], end),
+            registry.detector_window_stats(record["event_time"], end),
             settings.api_prefix,
         )
 

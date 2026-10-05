@@ -51,6 +51,8 @@ def test_interface_run_routes_and_download(client, store):
     assert found["title"] == "Cosmic calibration"
     assert found["beamStatus"] == "unknown"
     assert found["experimentId"] == "unknown"
+    assert found["pointCount"] == 1
+    assert found["estimatedJsonBytes"] > 0
     detail = client.get(f"/api/v1/runs/{found['id']}")
     assert detail.status_code == 200
     body = detail.json()
@@ -79,6 +81,11 @@ def test_interface_run_routes_and_download(client, store):
         row["_value"] for row in client.get(second_detail["artifacts"][1]["downloadUrl"]).json()
     ] == ["boundary"]
     assert client.get("/api/v1/runs").json()["total"] == 2
+    assert client.get("/api/v1/runs?hasData=true&pageSize=1").json()["totalPages"] == 2
+    assert client.get("/api/v1/runs?hasData=false").json()["total"] == 0
+    assert client.get("/api/v1/runs?beam=on").json()["total"] == 0
+    suggestions = client.get("/api/v1/runs/suggestions?q=cos").json()["suggestions"]
+    assert suggestions[0]["title"] == "Cosmic calibration"
     assert client.get("/api/v1/runs?q=absent").json()["runs"] == []
     assert client.get("/api/v1/runs/unknown").status_code == 404
     assert client.get("/api/v1/runs?from=2026-09-30&to=2026-09-01").status_code == 400
@@ -231,6 +238,12 @@ def test_beam_events_and_measurements_follow_trigger_windows(client, store):
     second = client.get(f"/api/v1/runs/{runs['second']['id']}").json()["beam"]
     assert second["energy"] is None
     assert second["events"] == []
+    assert client.get("/api/v1/runs?beam=on").json()["total"] == 1
+    assert client.get("/api/v1/runs?beam=off").json()["total"] == 2
+    diagnostics = client.get("/api/v1/diagnostics").json()
+    assert len(diagnostics["runStarts"]) == 3
+    assert [change["status"] for change in diagnostics["beamChanges"]] == ["ON", "OFF"]
+    assert diagnostics["sources"]["trigger"]["earliest"] == "2026-09-27T14:00:00Z"
 
 
 def test_beam_session_spanning_run_boundary(client, store):

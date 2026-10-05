@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS poll_checkpoints (
     source TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_sync (
+    source TEXT PRIMARY KEY,
+    last_success_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS run_summaries (
     source_instance TEXT NOT NULL,
     run_number TEXT NOT NULL,
@@ -282,6 +286,66 @@ class RegistryStore:
                 (source, value),
             )
 
+    def mark_synced(self, source: str, at: datetime) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO source_sync(source,last_success_at) VALUES(?,?) "
+                "ON CONFLICT(source) DO UPDATE SET last_success_at=excluded.last_success_at",
+                (source, at.astimezone(UTC).isoformat().replace("+00:00", "Z")),
+            )
+
+    def source_status(self) -> dict[str, dict[str, Any]]:
+        with closing(self.connect()) as connection:
+            synced = {
+                row["source"]: row["last_success_at"]
+                for row in connection.execute("SELECT source,last_success_at FROM source_sync")
+            }
+            checkpoints = {
+                row["source"]: row["value"]
+                for row in connection.execute("SELECT source,value FROM poll_checkpoints")
+            }
+            sources = {}
+            for name, condition in (
+                ("trigger", "source='trigger_history'"),
+                ("logbook", "source LIKE 'logbook_%'"),
+            ):
+                row = connection.execute(
+                    "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
+                    f"FROM collected_records WHERE {condition}"
+                ).fetchone()
+                sources[name] = {
+                    "earliest": row["earliest"],
+                    "latest": row["latest"],
+                    "lastSyncedAt": synced.get(name),
+                }
+            point_range = connection.execute(
+                "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
+                "FROM detector_points"
+            ).fetchone()
+            legacy_range = connection.execute(
+                "SELECT MIN(event_time) AS earliest,MAX(event_time) AS latest "
+                "FROM collected_records WHERE source='influx'"
+            ).fetchone()
+        starts = [value for value in (point_range["earliest"], legacy_range["earliest"]) if value]
+        ends = [value for value in (point_range["latest"], legacy_range["latest"]) if value]
+        reverse_key = next(
+            (key for key in checkpoints if key.startswith("influx-backfill-reverse:")), None
+        )
+        sources["influx"] = {
+            "earliest": min(starts) if starts else None,
+            "latest": max(ends) if ends else None,
+            "lastSyncedAt": synced.get("influx"),
+            "scannedThrough": checkpoints.get("influx"),
+            "backfillCursor": checkpoints.get(reverse_key) if reverse_key else None,
+            "backfillUpper": (
+                checkpoints.get(reverse_key.replace("-reverse:", "-upper:"))
+                if reverse_key
+                else None
+            ),
+            "backfillLastSyncedAt": synced.get("influx_backfill"),
+        }
+        return sources
+
     @staticmethod
     def document(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
@@ -377,6 +441,45 @@ class RegistryStore:
                 parameters,
             ).fetchone()
         return dict(row) if row is not None else None
+
+    def detector_window_stats(self, start: str, end: str | None) -> dict[str, int]:
+        condition, parameters = self._interval(start, end)
+        legacy_condition = (
+            "r.source='influx' AND "
+            + condition
+            + " AND NOT EXISTS (SELECT 1 FROM collected_records AS newer "
+            "WHERE newer.source=r.source AND newer.source_instance=r.source_instance "
+            "AND newer.source_id=r.source_id AND newer.revision>r.revision) "
+            "AND NOT EXISTS (SELECT 1 FROM detector_points AS d "
+            "WHERE d.source_instance=r.source_instance AND d.source_id=r.source_id)"
+        )
+        with closing(self.connect()) as connection:
+            point_count = connection.execute(
+                f"SELECT COUNT(*) FROM detector_points AS r WHERE {condition}", parameters
+            ).fetchone()[0]
+            legacy_count = connection.execute(
+                f"SELECT COUNT(*) FROM collected_records AS r WHERE {legacy_condition}", parameters
+            ).fetchone()[0]
+            samples = [
+                row[0]
+                for row in connection.execute(
+                    f"SELECT LENGTH(point_json) FROM detector_points AS r "
+                    f"WHERE {condition} LIMIT 32",
+                    parameters,
+                )
+            ]
+            legacy_samples = [
+                row[0]
+                for row in connection.execute(
+                    f"SELECT LENGTH(raw_json) FROM collected_records AS r "
+                    f"WHERE {legacy_condition} LIMIT 32",
+                    parameters,
+                )
+            ]
+        estimate = sum(samples) * point_count // len(samples) if samples else 0
+        if legacy_samples:
+            estimate += sum(legacy_samples) * legacy_count // len(legacy_samples)
+        return {"pointCount": point_count + legacy_count, "estimatedJsonBytes": estimate}
 
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, parameters = self._interval(start, end)

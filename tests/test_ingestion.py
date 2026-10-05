@@ -44,6 +44,10 @@ def test_poll_stores_raw_and_processed_copies_without_duplicate_versions(store):
     assert first == {"trigger": 202, "logbook": 28}
     second = job.run_once()
     assert second == first
+    status = store.source_status()
+    assert status["trigger"]["lastSyncedAt"] is not None
+    assert status["logbook"]["lastSyncedAt"] is not None
+    assert status["influx"]["lastSyncedAt"] is None
     records, total = store.records("logbook_event", 1, 20)
     assert total == 13
     assert all(row["revision"] == 1 for row in records)

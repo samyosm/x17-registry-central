@@ -92,6 +92,10 @@ def test_reverse_backfill_starts_newest_and_skips_empty_years(store):
     assert reader.windows[0][0] > older
     assert store.checkpoint("influx-backfill-reverse:test-influx") == start.isoformat()
     assert store.checkpoint("influx") == store.checkpoint("influx-backfill-upper:test-influx")
+    status = store.source_status()["influx"]
+    assert status["backfillCursor"] == start.isoformat()
+    assert status["backfillUpper"] == store.checkpoint("influx")
+    assert status["backfillLastSyncedAt"] is not None
     assert {update["event"] for update in updates} >= {
         "started",
         "window_started",

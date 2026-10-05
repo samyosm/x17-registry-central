@@ -80,6 +80,7 @@ class PollJob:
             self.store.save_detector_batch(detector_batch)
         if checkpoint is not None:
             self.store.set_checkpoint(name, checkpoint)
+        self.store.mark_synced(name, datetime.now(UTC))
         return count
 
     def run_once(self) -> dict[str, int | str]:

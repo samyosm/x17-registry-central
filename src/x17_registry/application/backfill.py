@@ -209,6 +209,7 @@ def backfill_influx(
 
             cursor = start
             store.set_checkpoint(cursor_key, cursor.isoformat())
+            store.mark_synced("influx_backfill", datetime.now(UTC))
             windows += 1
             state.update(
                 cursor=cursor.isoformat(),
@@ -225,6 +226,7 @@ def backfill_influx(
             if previous is None:
                 cursor = lower
                 store.set_checkpoint(cursor_key, cursor.isoformat())
+                store.mark_synced("influx_backfill", datetime.now(UTC))
                 state.update(cursor=cursor.isoformat(), percent_time_scanned=100.0)
                 break
             next_cursor = min(cursor, previous + timedelta(microseconds=1))
@@ -232,6 +234,7 @@ def backfill_influx(
                 raise ValueError("InfluxDB returned an invalid previous point time.")
             cursor = next_cursor
             store.set_checkpoint(cursor_key, cursor.isoformat())
+            store.mark_synced("influx_backfill", datetime.now(UTC))
             skipped += 1
             window_seconds = float(settings.influx_window_seconds)
             state.update(
