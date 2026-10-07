@@ -274,8 +274,8 @@ def test_beam_events_and_measurements_follow_trigger_windows(client, store):
 
     runs = {run["title"]: run for run in client.get("/api/v1/runs").json()["runs"]}
     assert runs["first"]["beamStatus"] == "on"
-    assert runs["second"]["beamStatus"] == "off"
-    assert runs["third"]["beamStatus"] == "off"
+    assert runs["second"]["beamStatus"] == "unknown"
+    assert runs["third"]["beamStatus"] == "unknown"
     first = client.get(f"/api/v1/runs/{runs['first']['id']}").json()["beam"]
     assert first["energy"] == "4.5 MeV"
     assert first["current"] == "3 nA"
@@ -285,7 +285,8 @@ def test_beam_events_and_measurements_follow_trigger_windows(client, store):
     assert second["energy"] is None
     assert second["events"] == []
     assert client.get("/api/v1/runs?beam=on").json()["total"] == 1
-    assert client.get("/api/v1/runs?beam=off").json()["total"] == 2
+    assert client.get("/api/v1/runs?beam=off").json()["total"] == 0
+    assert client.get("/api/v1/runs?beam=unknown").json()["total"] == 2
     diagnostics = client.get("/api/v1/diagnostics").json()
     assert len(diagnostics["runStarts"]) == 3
     assert [change["status"] for change in diagnostics["beamChanges"]] == ["ON", "OFF"]
@@ -324,6 +325,7 @@ def test_beam_session_spanning_run_boundary(client, store):
         ),
         {},
     )
-    assert client.get(f"/api/v1/runs/{first['id']}").json()["beam"]["energy"] == "100 keV"
+    assert client.get(f"/api/v1/runs/{first['id']}").json()["beam"]["energy"] is None
     second = client.get("/api/v1/runs?q=second").json()["runs"][0]
-    assert second["beamStatus"] == "on"
+    assert second["beamStatus"] == "unknown"
+    assert client.get(f"/api/v1/runs/{second['id']}").json()["beam"]["energy"] is None

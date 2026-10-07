@@ -39,6 +39,7 @@ def beam_context(
     sessions: list[dict[str, Any]] = []
     observed_off = False
     segment_start = beginning
+    current_during_run = False
 
     for record in records:
         status = _status(record)
@@ -63,23 +64,19 @@ def beam_context(
         )
         current = record
         segment_start = at
+        current_during_run = True
 
-    if current is not None and _status(current) == "on" and (
+    if current_during_run and current is not None and _status(current) == "on" and (
         finish is None or finish > segment_start
     ):
         sessions.append(current)
-    if current is not None and _status(current) == "off":
-        observed_off = True
 
     active = sessions[-1] if sessions else None
     comment = active["raw"].get("comment") if active else None
     notes = []
     if current is not None:
         if not changes:
-            notes.append(
-                "No beam change was logged during this run; "
-                "the last operator status carries forward."
-            )
+            notes.append("No beam change was logged during this run; its status is unknown.")
         if active is not None:
             notes.append("Current and charge describe a beam session and are entered at beam OFF.")
         notes.append("Logbook entries are not instrument telemetry.")
