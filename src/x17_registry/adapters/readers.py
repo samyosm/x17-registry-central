@@ -138,6 +138,18 @@ def flux_csv_rows(response: Iterable[str]) -> Iterator[dict[str, str]]:
 class InfluxReader(SeekableInfluxReader):
     def __init__(self, settings: PollSettings) -> None:
         self.settings = settings
+        self.window_seconds = float(settings.influx_window_seconds)
+
+    def shrink_window(self) -> bool:
+        # Below twice the overlap, each poll would barely advance the checkpoint.
+        floor = max(2 * self.settings.influx_overlap_seconds, 1)
+        if self.window_seconds <= floor:
+            return False
+        self.window_seconds = max(self.window_seconds / 2, floor)
+        return True
+
+    def grow_window(self) -> None:
+        self.window_seconds = min(self.window_seconds * 2, self.settings.influx_window_seconds)
 
     def read(
         self, checkpoint: str | None, now: datetime
@@ -152,7 +164,7 @@ class InfluxReader(SeekableInfluxReader):
             else settings.influx_start_at
         )
         start = max(start, settings.influx_start_at)
-        stop = min(start + timedelta(seconds=settings.influx_window_seconds), now)
+        stop = min(start + timedelta(seconds=self.window_seconds), now)
         if start >= stop:
             return (), None
         return self.read_window(start, stop), stop.astimezone(UTC).isoformat()
