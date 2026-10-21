@@ -6,7 +6,7 @@ import logging
 import secrets
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -16,6 +16,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from x17_registry.adapters.clickhouse import ClickHouseClient, ClickHouseError
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.beam import beam_context
+from x17_registry.application.channels import PMT_CHANNELS
 from x17_registry.config import Settings
 
 
@@ -305,6 +306,49 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
                 if isinstance(record["raw"].get("payload"), dict)
                 and record["raw"]["payload"].get("status") in ("ON", "OFF")
             ],
+        }
+
+    @api.get("/events")
+    def detector_events(
+        from_time: Annotated[datetime, Query(alias="from")],
+        to_time: Annotated[datetime, Query(alias="to")],
+        buckets: int = Query(120, ge=10, le=600),
+    ) -> dict[str, Any]:
+        """Per-PMT ADC activity in [from, to), summarised into equal time buckets."""
+        start = from_time if from_time.tzinfo else from_time.replace(tzinfo=UTC)
+        end = to_time if to_time.tzinfo else to_time.replace(tzinfo=UTC)
+        if start >= end:
+            raise HTTPException(400, "from must be before to")
+        start_ns = int(start.timestamp()) * 1_000_000_000 + start.microsecond * 1_000
+        end_ns = int(end.timestamp()) * 1_000_000_000 + end.microsecond * 1_000
+        width_ns = max(1, -(-(end_ns - start_ns) // buckets))
+        series = {
+            field: {"channel": label, "end": pmt_end, "events": 0, "points": []}
+            for field, (label, pmt_end) in PMT_CHANNELS.items()
+        }
+        for row in registry.detector_series(start_ns, end_ns, width_ns):
+            entry = series.get(row["field"])
+            if entry is None:
+                continue
+            entry["events"] += int(row["n"])
+            entry["points"].append(
+                {
+                    "at": registry._event_at(start_ns + int(row["bucket"]) * width_ns),
+                    "count": int(row["n"]),
+                    "mean": round(float(row["mean"]), 2),
+                    "min": float(row["low"]),
+                    "max": float(row["high"]),
+                }
+            )
+        latest = registry.latest_detector_ns()
+        return {
+            "from": registry._event_at(start_ns),
+            "to": registry._event_at(end_ns),
+            "bucketSeconds": width_ns / 1e9,
+            "latestEventAt": registry._event_at(latest) if latest is not None else None,
+            "channels": sorted(
+                series.values(), key=lambda item: (item["end"], int(item["channel"][1:]))
+            ),
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:

@@ -329,3 +329,46 @@ def test_beam_session_spanning_run_boundary(client, store):
     second = client.get("/api/v1/runs?q=second").json()["runs"][0]
     assert second["beamStatus"] == "unknown"
     assert client.get(f"/api/v1/runs/{second['id']}").json()["beam"]["energy"] is None
+
+
+def test_events_summarise_pmt_adc_values_in_time_buckets(client, store):
+    def point(identity, at, field, value):
+        return SourceRecord(
+            "influx",
+            "test-influx",
+            identity,
+            {
+                "_time": at,
+                "_measurement": "run_80",
+                "VF48_num": "0",
+                "_field": field,
+                "_value": value,
+            },
+            at,
+            "80",
+        )
+
+    store.save_detector_batch(
+        [
+            point("a", "2026-09-27T14:00:01Z", "FPGA0_ADCB", "100"),
+            point("b", "2026-09-27T14:00:02Z", "FPGA0_ADCB", "300"),
+            point("c", "2026-09-27T14:00:03Z", "FPGA2_ADCA", "50"),
+            point("d", "2026-09-27T14:00:04Z", "trignum", "9"),
+            point("e", "2026-09-27T15:00:00Z", "FPGA0_ADCB", "7"),
+        ]
+    )
+    body = client.get(
+        "/api/v1/events", params={"from": "2026-09-27T14:00:00Z", "to": "2026-09-27T14:05:00Z"}
+    ).json()
+    channels = {item["channel"]: item for item in body["channels"]}
+    assert len(channels) == 32
+    assert channels["D15"]["events"] == 2
+    assert channels["D15"]["points"][0]["mean"] == 200
+    assert channels["D15"]["points"][0]["max"] == 300
+    assert channels["U0"]["events"] == 1
+    assert channels["D0"]["points"] == []
+    assert body["latestEventAt"] == "2026-09-27T15:00:00Z"
+    backwards = client.get(
+        "/api/v1/events", params={"from": "2026-09-27T14:05:00Z", "to": "2026-09-27T14:00:00Z"}
+    )
+    assert backwards.status_code == 400

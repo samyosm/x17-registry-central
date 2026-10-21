@@ -287,6 +287,24 @@ class RegistryStore:
             "run_number": rows[0]["run_number"],
         }
 
+    def latest_detector_ns(self) -> int | None:
+        rows = self.client.query("SELECT maxOrNull(event_ns) AS last_ns FROM detector_points")
+        return int(rows[0]["last_ns"]) if rows and rows[0].get("last_ns") is not None else None
+
+    def detector_series(self, start_ns: int, end_ns: int, width_ns: int) -> list[dict[str, Any]]:
+        """Per-field time buckets (count, mean, min, max) for ADC fields in [start, end)."""
+        return self.client.query(
+            "SELECT field, intDiv(event_ns-{start:Int64},{width:Int64}) AS bucket, "
+            "count() AS n, avg(value) AS mean, min(value) AS low, max(value) AS high "
+            "FROM (SELECT event_ns, "
+            "JSONExtractString(point_json,'_field') AS field, "
+            "toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value'))) AS value "
+            "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64}) "
+            "WHERE value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
+            "GROUP BY field, bucket ORDER BY field, bucket",
+            {"start": start_ns, "end": end_ns, "width": width_ns},
+        )
+
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, params = self._interval(start, end)
         for row in self.client.iterate(
