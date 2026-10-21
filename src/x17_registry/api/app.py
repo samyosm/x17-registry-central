@@ -286,8 +286,16 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
 
     @api.get("/diagnostics")
     def diagnostics() -> dict[str, Any]:
+        sources = registry.source_status()
+        statuses = registry.statuses()
+        for name, source in sources.items():
+            source["poll"] = statuses.get(name)
         return {
-            "sources": registry.source_status(),
+            "sources": sources,
+            "poller": statuses.get("poller"),
+            "backfill": statuses.get("influx_backfill"),
+            "checkpoints": registry.checkpoints(),
+            "serverTime": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
             "runStarts": [
                 {
                     "at": record["event_time"],

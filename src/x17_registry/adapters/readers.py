@@ -139,6 +139,7 @@ class InfluxReader(SeekableInfluxReader):
     def __init__(self, settings: PollSettings) -> None:
         self.settings = settings
         self.window_seconds = float(settings.influx_window_seconds)
+        self._window: tuple[datetime, datetime] | None = None
 
     def shrink_window(self) -> bool:
         # Below twice the overlap, each poll would barely advance the checkpoint.
@@ -149,7 +150,10 @@ class InfluxReader(SeekableInfluxReader):
         return True
 
     def grow_window(self) -> None:
-        self.window_seconds = min(self.window_seconds * 2, self.settings.influx_window_seconds)
+        self.window_seconds = min(self.window_seconds * 1.25, self.settings.influx_window_seconds)
+
+    def current_window(self) -> tuple[datetime, datetime] | None:
+        return self._window
 
     def read(
         self, checkpoint: str | None, now: datetime
@@ -166,7 +170,9 @@ class InfluxReader(SeekableInfluxReader):
         start = max(start, settings.influx_start_at)
         stop = min(start + timedelta(seconds=self.window_seconds), now)
         if start >= stop:
+            self._window = (start, start)
             return (), None
+        self._window = (start, stop)
         return self.read_window(start, stop), stop.astimezone(UTC).isoformat()
 
     def read_window(self, start: datetime, stop: datetime) -> Iterator[SourceRecord]:

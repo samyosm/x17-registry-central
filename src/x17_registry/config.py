@@ -52,6 +52,7 @@ class PollSettings(CommonSettings):
     influx_window_seconds: int = Field(gt=0)
     influx_timeout_seconds: float = Field(gt=0)
     influx_backfill_batch_size: int = Field(gt=0)
+    influx_attempt_seconds: float = Field(default=300, gt=0)
 
     @field_validator(
         "influx_url",

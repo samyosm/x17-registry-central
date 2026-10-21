@@ -150,7 +150,7 @@ class RegistryStore:
             "AND source={source:String} LIMIT 1",
             {"kind": kind, "source": source},
         )
-        return str(rows[0]["value"]) if rows else None
+        return str(rows[0]["value"]) or None if rows else None
 
     def _set_state(self, kind: str, source: str, value: str) -> None:
         self.client.insert(
@@ -163,6 +163,45 @@ class RegistryStore:
 
     def set_checkpoint(self, source: str, value: str) -> None:
         self._set_state("checkpoint", source, value)
+
+    def clear_checkpoints(self, prefix: str) -> list[str]:
+        """Forget every checkpoint whose name starts with prefix; returns the cleared names."""
+        names = [
+            row["source"]
+            for row in self.client.query(
+                "SELECT source FROM registry_state FINAL WHERE kind='checkpoint' "
+                "AND startsWith(source,{prefix:String}) AND value!=''",
+                {"prefix": prefix},
+            )
+        ]
+        for name in names:
+            self._set_state("checkpoint", name, "")
+        return names
+
+    def checkpoints(self) -> list[dict[str, str]]:
+        return [
+            {
+                "name": row["source"],
+                "value": row["value"],
+                "updatedAt": self._event_at(int(row["version"])),
+            }
+            for row in self.client.query(
+                "SELECT source,value,version FROM registry_state FINAL "
+                "WHERE kind='checkpoint' AND value!='' ORDER BY source"
+            )
+        ]
+
+    def set_status(self, source: str, status: dict[str, Any]) -> None:
+        self._set_state("status", source, json.dumps(status, separators=(",", ":")))
+
+    def statuses(self) -> dict[str, dict[str, Any]]:
+        return {
+            row["source"]: json.loads(row["value"])
+            for row in self.client.query(
+                "SELECT source,value FROM registry_state FINAL "
+                "WHERE kind='status' AND value!=''"
+            )
+        }
 
     def mark_synced(self, source: str, at: datetime) -> None:
         self._set_state("synced", source, at.astimezone(UTC).isoformat().replace("+00:00", "Z"))
@@ -177,7 +216,9 @@ class RegistryStore:
     def source_status(self) -> dict[str, dict[str, Any]]:
         state = {
             (row["kind"], row["source"]): row["value"]
-            for row in self.client.query("SELECT kind,source,value FROM registry_state FINAL")
+            for row in self.client.query(
+                "SELECT kind,source,value FROM registry_state FINAL WHERE value!=''"
+            )
         }
         sources: dict[str, dict[str, Any]] = {}
         for name, condition in (
