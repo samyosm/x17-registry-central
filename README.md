@@ -10,3 +10,23 @@ Requires Python 3.12+, uv, and ClickHouse. Start `clickhouse-server.service` as 
 Enable the Influx settings before detector polling. Run `uv run x17-registry backfill-influx` with the poller stopped to import historical detector points. Repeated polling and backfill windows are deduplicated when queried. CSV and JSON downloads are generated on demand.
 
 Run `uv run --with chdb pytest -q` to test the API, polling, and backfill with an in-memory ClickHouse engine. Set `X17_TEST_CLICKHOUSE_URL` to run the same suite against a disposable ClickHouse HTTP service.
+
+## Keeping the Influx poller current
+
+`poll` reads at most `X17_INFLUX_WINDOW_SECONDS` of detector data per attempt. If an attempt fails mid-stream or runs longer than `X17_INFLUX_ATTEMPT_SECONDS`, the window is halved and retried (down to twice `X17_INFLUX_OVERLAP_SECONDS`), then grows back after successes. While the poller is more than two minutes behind, it reads window after window without waiting for the poll interval. This is how it catches up after an outage, so `backfill-influx` is only needed for history before the forward checkpoint.
+
+The poller records its state (reading, retrying, failing, catching up), the current window, retry reason, last error, and consecutive failures in the registry. The diagnostics page shows them next to every checkpoint.
+
+## Inspecting and moving checkpoints
+
+No SQL is needed:
+
+```sh
+uv run x17-registry status                                  # checkpoints plus poller/backfill status as JSON
+uv run x17-registry backfill-influx --since 2026-10-09      # scan back only to this time
+uv run x17-registry backfill-influx --restart --since 2026-10-09
+uv run x17-registry reset-backfill                          # forget the saved backfill position; no data is deleted
+uv run x17-registry set-checkpoint influx now               # move the forward scan (skips unread data)
+```
+
+`backfill-influx` resumes where it stopped unless `--restart` is given. `set-checkpoint` accepts an ISO time or `now` and only for checkpoints that exist.

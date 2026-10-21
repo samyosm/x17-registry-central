@@ -5,8 +5,8 @@ from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from time import monotonic
 from http.client import IncompleteRead, RemoteDisconnected
+from time import monotonic
 from typing import Any
 
 CATCH_UP_LAG = timedelta(seconds=120)
