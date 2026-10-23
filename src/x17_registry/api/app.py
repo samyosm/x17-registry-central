@@ -451,7 +451,8 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "readings": len(rows),
             "truncated": truncated,
             "threshold": model.threshold,
-            **result,
+            **{key: value for key, value in result.items() if key != "template_median"},
+            "templateMedian": result["template_median"],
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:

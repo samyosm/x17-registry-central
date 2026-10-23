@@ -159,5 +159,13 @@ def test_diagnostics_show_a_scale_mismatch(isotope_client, store):
     assert body["d"]["n"] == 3001
     assert len(body["observed"]) == len(body["muon"]) == 200
     assert body["fit"]["isotope"] in {"Cs-137"}
+    # The page reads exactly these keys.
+    assert body["templateMedian"] > 0
+    assert "template_median" not in body
+    assert set(body) >= {
+        "scintillator", "from", "to", "limit", "readings", "truncated", "threshold", "d", "u",
+        "pairs", "unpaired", "values", "below", "above", "zero", "edges", "observed", "muon",
+        "fit", "templateMedian", "scale",
+    }
     missing = isotope_client.get("/api/v1/identification/99", params=PARAMS)
     assert missing.status_code == 404
