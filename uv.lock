@@ -1048,6 +1048,17 @@ requires-dist = [
     { name = "uproot" },
 ]
 
+[package.metadata.requires-dev]
+analysis = [
+    { name = "awkward" },
+    { name = "matplotlib" },
+    { name = "tqdm" },
+]
+scripts = [
+    { name = "awkward" },
+    { name = "tqdm" },
+]
+
 [[package]]
 name = "x17-registry-central"
 version = "0.1.0"
