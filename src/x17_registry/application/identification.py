@@ -1,8 +1,8 @@
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-import numpy as np
-
+from x17_registry.adapters.detector_sql import PairSpec
+from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.channels import PMT_CHANNELS
 
 
@@ -11,19 +11,33 @@ class IdentifierUnavailable(RuntimeError):
 
 
 class Identifier(Protocol):
+    """The part of x17-isotope-id's Identifier that the registry uses."""
+
     threshold: float
     min_pairs: int
+    filter: Mapping[str, Any]
+    raw_start: int
+    raw_bins: int
 
-    def identify(
-        self,
-        times: Any,
-        fields: Any,
-        adc: Any,
-        groups: Mapping[str, tuple[str, str]],
+    def pedestal(self, field: str) -> float: ...
+
+    def bin_layout(self) -> tuple[float, float, int]: ...
+
+    def identify_histograms(
+        self, histograms: Mapping[str, tuple[Any, int]]
     ) -> list[dict[str, Any]]: ...
 
-    def diagnose(
-        self, times: Any, fields: Any, adc: Any, d_field: str, u_field: str
+    def diagnose_histogram(
+        self,
+        counts: Any,
+        pair_summary: dict[str, Any],
+        d: dict[str, Any],
+        u: dict[str, Any],
+        matched: int,
+        below: int,
+        above: int,
+        zero: int,
+        raw: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -56,25 +70,48 @@ def load_identifier(config_path: str | None) -> Identifier:
         ) from error
 
 
-def reading_arrays(readings: list[dict[str, Any]]) -> tuple[Any, Any, Any]:
-    times = np.array([int(row["event_ns"]) for row in readings], dtype=np.int64)
-    fields = np.array([row["field"] for row in readings], dtype=str)
-    adc = np.array([float(row["value"]) for row in readings], dtype=np.float64)
-    return times, fields, adc
+def pair_spec(identifier: Identifier) -> PairSpec:
+    """What the database has to compute for the identifier: bins, acquisition filter, pedestals."""
+    groups = scintillator_groups()
+    low, high, bins = identifier.bin_layout()
+    return PairSpec(
+        groups=groups,
+        low=low,
+        high=high,
+        bins=bins,
+        filter_enabled=bool(identifier.filter["enabled"]),
+        filter_mode=str(identifier.filter["mode"]),
+        filter_threshold=float(identifier.filter["threshold"]),
+        pedestals={field: identifier.pedestal(field) for pair in groups.values() for field in pair},
+    )
 
 
-def identify_readings(
-    identifier: Identifier, readings: list[dict[str, Any]]
+def identify_period(
+    store: RegistryStore,
+    identifier: Identifier,
+    start_ns: int,
+    end_ns: int,
+    timeout: float | None = None,
 ) -> list[dict[str, Any]]:
-    """One result per scintillator from rows of {event_ns, field, value}."""
-    return identifier.identify(*reading_arrays(readings), scintillator_groups())
+    """One result per scintillator from every reading of the period."""
+    histograms = store.pair_histograms(pair_spec(identifier), start_ns, end_ns, timeout)
+    return identifier.identify_histograms(histograms)
 
 
-def diagnose_readings(
-    identifier: Identifier, readings: list[dict[str, Any]], scintillator: str
+def diagnose_period(
+    store: RegistryStore,
+    identifier: Identifier,
+    scintillator: str,
+    start_ns: int,
+    end_ns: int,
+    timeout: float | None = None,
 ) -> dict[str, Any] | None:
     """Data-scale diagnostics of one scintillator; None if the scintillator is unknown."""
-    pair = scintillator_groups().get(scintillator)
-    if pair is None:
+    spec = pair_spec(identifier)
+    if scintillator not in spec.groups:
         return None
-    return identifier.diagnose(*reading_arrays(readings), *pair)
+    inputs = store.pair_diagnostics(
+        spec, scintillator, start_ns, end_ns, identifier.raw_start, identifier.raw_bins, timeout
+    )
+    scan = inputs.pop("scan")
+    return identifier.diagnose_histogram(**inputs) | {"scan": scan}

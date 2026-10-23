@@ -7,6 +7,7 @@ from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from typing import Any
 
+from x17_registry.adapters import detector_sql
 from x17_registry.adapters.clickhouse import ClickHouseClient
 from x17_registry.application.polling import SourceRecord
 
@@ -47,6 +48,13 @@ SCHEMA = (
         event_time String, run_number String, point_json String, version UInt64
     ) ENGINE = ReplacingMergeTree(version)
     ORDER BY (event_ns,source_instance,source_id)""",
+    # The channel and ADC value of a point, stored beside its JSON so that analysis queries do not
+    # parse the JSON of every row. Rows stored before these columns exist are computed when read
+    # until `x17-registry materialize-detector-columns` has rewritten them.
+    "ALTER TABLE detector_points ADD COLUMN IF NOT EXISTS field LowCardinality(String) "
+    "MATERIALIZED JSONExtractString(point_json,'_field')",
+    "ALTER TABLE detector_points ADD COLUMN IF NOT EXISTS value Nullable(Float64) "
+    "MATERIALIZED toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value')))",
     """CREATE TABLE IF NOT EXISTS registry_state (
         kind LowCardinality(String), source String, value String, version UInt64
     ) ENGINE = ReplacingMergeTree(version) ORDER BY (kind,source)""",
@@ -63,6 +71,15 @@ class RegistryStore:
         )
         for statement in SCHEMA:
             self.client.execute(statement)
+
+    def materialize_detector_columns(self) -> None:
+        """Start rewriting `field` and `value` for rows stored before the columns existed.
+
+        Runs as a background ClickHouse mutation that rewrites only these two columns and
+        leaves the stored points untouched; until it has finished, queries still work.
+        """
+        for column in ("field", "value"):
+            self.client.execute(f"ALTER TABLE detector_points MATERIALIZE COLUMN {column}")
 
     @staticmethod
     def document(row: dict[str, Any]) -> dict[str, Any]:
@@ -337,27 +354,95 @@ class RegistryStore:
         return self.client.query(
             "SELECT field, intDiv(event_ns-{start:Int64},{width:Int64}) AS bucket, "
             "count() AS n, avg(value) AS mean, min(value) AS low, max(value) AS high "
-            "FROM (SELECT event_ns, "
-            "JSONExtractString(point_json,'_field') AS field, "
-            "toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value'))) AS value "
-            "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64}) "
-            "WHERE value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
+            "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64} "
+            "AND value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
             "GROUP BY field, bucket ORDER BY field, bucket",
             {"start": start_ns, "end": end_ns, "width": width_ns},
         )
 
-    def detector_readings(self, start_ns: int, end_ns: int, limit: int) -> list[dict[str, Any]]:
-        """The first `limit` ADC readings (event_ns, field, value) in [start, end), by time."""
-        return self.client.query(
-            "SELECT event_ns, field, value "
-            "FROM (SELECT event_ns, "
-            "JSONExtractString(point_json,'_field') AS field, "
-            "toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value'))) AS value "
-            "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64}) "
-            "WHERE value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
-            "ORDER BY event_ns LIMIT {limit:UInt64}",
-            {"start": start_ns, "end": end_ns, "limit": limit},
+    def count_readings(self, start_ns: int, end_ns: int, timeout: float | None = None) -> int:
+        rows = self.client.query(detector_sql.readings_sql(start_ns, end_ns), timeout=timeout)
+        return int(rows[0]["n"])
+
+    def pair_histograms(
+        self,
+        spec: detector_sql.PairSpec,
+        start_ns: int,
+        end_ns: int,
+        timeout: float | None = None,
+        names: list[str] | None = None,
+    ) -> dict[str, tuple[list[int], int]]:
+        """{group: (accepted pairs per histogram bin, accepted pairs in all)} over the period."""
+        names = names or list(spec.groups)
+        counts = {name: [0] * spec.bins for name in names}
+        pairs = dict.fromkeys(names, 0)
+        for row in self.client.query(
+            detector_sql.histogram_sql(spec, names, start_ns, end_ns), timeout=timeout
+        ):
+            name = names[int(row["scint"])]
+            pairs[name] += int(row["n"])
+            if int(row["bin"]) >= 0:
+                counts[name][int(row["bin"])] += int(row["n"])
+        return {name: (counts[name], pairs[name]) for name in names}
+
+    def pair_diagnostics(
+        self,
+        spec: detector_sql.PairSpec,
+        name: str,
+        start_ns: int,
+        end_ns: int,
+        raw_start: int,
+        raw_bins: int,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """The inputs of Identifier.diagnose_histogram for one group over the period."""
+        d_field, u_field = spec.groups[name]
+        counts, _ = self.pair_histograms(spec, start_ns, end_ns, timeout, [name])[name]
+        stats = self.client.query(
+            detector_sql.pair_statistics_sql(spec, name, start_ns, end_ns), timeout=timeout
+        )[0]
+        channels = self.client.query(
+            detector_sql.channel_statistics_sql(d_field, u_field, start_ns, end_ns),
+            timeout=timeout,
+        )[0]
+        raw: dict[str, Any] = {
+            "start": raw_start,
+            "d": [0] * raw_bins,
+            "u": [0] * raw_bins,
+        }
+        for row in self.client.query(
+            detector_sql.raw_histogram_sql(d_field, u_field, start_ns, end_ns, raw_start, raw_bins),
+            timeout=timeout,
+        ):
+            raw["du"[int(row["endp"])]][int(row["b"]) - raw_start] = int(row["n"])
+        d = detector_sql.summary(
+            channels["d_n"], channels["d_negative"], channels["d_min"], channels["d_max"],
+            channels["d_q"],
         )
+        u = detector_sql.summary(
+            channels["u_n"], channels["u_negative"], channels["u_min"], channels["u_max"],
+            channels["u_q"],
+        )
+        scan = self.client.query(
+            detector_sql.threshold_scan_sql(spec, name, start_ns, end_ns), timeout=timeout
+        )[0]
+        return {
+            "counts": counts,
+            "pair_summary": detector_sql.summary(
+                stats["n"], 0, stats["low"], stats["high"], stats["q"]
+            ),
+            "d": d,
+            "u": u,
+            "matched": int(scan["matched"]),
+            "below": int(stats["below"]),
+            "above": int(stats["above"]),
+            "zero": int(stats["zero"]),
+            "raw": raw,
+            "scan": {
+                "thresholds": list(detector_sql.SCAN_THRESHOLDS),
+                "pairs": [int(scan[f"t{t}"]) for t in detector_sql.SCAN_THRESHOLDS],
+            },
+        }
 
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, params = self._interval(start, end)

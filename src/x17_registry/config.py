@@ -24,6 +24,7 @@ class Settings(CommonSettings):
     page_size: int = Field(gt=0)
     max_page_size: int = Field(gt=0)
     isotope_id_config: Path | None = None
+    identification_timeout_seconds: float = Field(default=280, gt=0)
 
     @field_validator("isotope_id_config", mode="before")
     @classmethod

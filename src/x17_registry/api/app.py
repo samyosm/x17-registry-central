@@ -20,8 +20,8 @@ from x17_registry.application.channels import PMT_CHANNELS
 from x17_registry.application.identification import (
     Identifier,
     IdentifierUnavailable,
-    diagnose_readings,
-    identify_readings,
+    diagnose_period,
+    identify_period,
     load_identifier,
 )
 from x17_registry.config import Settings
@@ -369,8 +369,8 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
     identifier: list[Identifier] = []
 
     def identification_input(
-        from_time: datetime, to_time: datetime, limit: int
-    ) -> tuple[Identifier, list[dict[str, Any]], bool, int, int]:
+        from_time: datetime, to_time: datetime
+    ) -> tuple[Identifier, int, int]:
         start = from_time if from_time.tzinfo else from_time.replace(tzinfo=UTC)
         end = to_time if to_time.tzinfo else to_time.replace(tzinfo=UTC)
         if start >= end:
@@ -379,8 +379,7 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             identifier.append(load_identifier(str(settings.isotope_id_config or "")))
         start_ns = int(start.timestamp()) * 1_000_000_000 + start.microsecond * 1_000
         end_ns = int(end.timestamp()) * 1_000_000_000 + end.microsecond * 1_000
-        rows = registry.detector_readings(start_ns, end_ns, limit + 1)
-        return identifier[0], rows[:limit], len(rows) > limit, start_ns, end_ns
+        return identifier[0], start_ns, end_ns
 
     @app.exception_handler(IdentifierUnavailable)
     async def identifier_unavailable(
@@ -391,29 +390,29 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             content={"error": {"code": "identifier_unavailable", "message": str(error)}},
         )
 
+    def filter_summary(model: Identifier) -> dict[str, Any]:
+        return {
+            "enabled": bool(model.filter["enabled"]),
+            "mode": str(model.filter["mode"]),
+            "threshold": float(model.filter["threshold"]),
+        }
+
     @api.get("/identification")
     def identification(
         from_time: Annotated[datetime, Query(alias="from")],
         to_time: Annotated[datetime, Query(alias="to")],
-        limit: int = Query(10_000, ge=100),
     ) -> Any:
-        """Identify the source near each scintillator from one histogram of the period.
-
-        Uses the first `limit` ADC readings of [from, to).
-        """
-        model, rows, truncated, start_ns, end_ns = identification_input(
-            from_time, to_time, limit
-        )
-        results = identify_readings(model, rows)
+        """Identify the source near each scintillator from one histogram of the whole period."""
+        model, start_ns, end_ns = identification_input(from_time, to_time)
+        timeout = settings.identification_timeout_seconds
+        results = identify_period(registry, model, start_ns, end_ns, timeout)
         return {
             "from": registry._event_at(start_ns),
             "to": registry._event_at(end_ns),
-            "limit": limit,
-            "readings": len(rows),
-            "truncated": truncated,
-            "readingsUntil": registry._event_at(int(rows[-1]["event_ns"])) if rows else None,
+            "readings": registry.count_readings(start_ns, end_ns, timeout),
             "threshold": model.threshold,
             "minPairs": model.min_pairs,
+            "filter": filter_summary(model),
             "scintillators": [
                 {
                     "scintillator": item["group"],
@@ -434,22 +433,18 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         scintillator: str,
         from_time: Annotated[datetime, Query(alias="from")],
         to_time: Annotated[datetime, Query(alias="to")],
-        limit: int = Query(10_000, ge=100),
     ) -> Any:
-        """Data scale of one scintillator against the templates, for the same readings."""
-        model, rows, truncated, start_ns, end_ns = identification_input(
-            from_time, to_time, limit
-        )
-        result = diagnose_readings(model, rows, scintillator)
+        """Data scale of one scintillator against the templates, over the whole period."""
+        model, start_ns, end_ns = identification_input(from_time, to_time)
+        timeout = settings.identification_timeout_seconds
+        result = diagnose_period(registry, model, scintillator, start_ns, end_ns, timeout)
         if result is None:
             raise HTTPException(404, "Scintillator not found")
         return {
             "scintillator": scintillator,
             "from": registry._event_at(start_ns),
             "to": registry._event_at(end_ns),
-            "limit": limit,
-            "readings": len(rows),
-            "truncated": truncated,
+            "readings": registry.count_readings(start_ns, end_ns, timeout),
             "threshold": model.threshold,
             **{key: value for key, value in result.items() if key != "template_median"},
             "templateMedian": result["template_median"],

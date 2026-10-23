@@ -78,7 +78,15 @@ def test_registry_schema_and_detector_query_use_replacing_final():
     store = RegistryStore(client)
     store.initialize()
     assert client.statements[0][1] == "default"
-    assert all("ReplacingMergeTree" in sql for sql, _ in client.statements[1:])
+    tables = [sql for sql, _ in client.statements[1:] if sql.startswith("CREATE TABLE")]
+    assert tables and all("ReplacingMergeTree" in sql for sql in tables)
+    # The channel and ADC value are added beside the JSON of each detector point.
+    columns = [sql for sql, _ in client.statements[1:] if sql.startswith("ALTER TABLE")]
+    assert len(columns) == 2
+    assert all(
+        "detector_points ADD COLUMN IF NOT EXISTS" in sql and "MATERIALIZED" in sql
+        for sql in columns
+    )
     store.influx_origin("2026-09-27T14:00:00Z", "2026-09-27T15:00:00Z")
     assert "detector_points FINAL" in client.queries[-1][0]
     assert client.queries[-1][1]["end"] - client.queries[-1][1]["start"] == 3_600_000_000_000
@@ -150,3 +158,12 @@ def test_clickhouse_round_trip_when_test_server_is_configured(store):
     )
     store.save_detector_batch([point, point])
     assert list(store.iter_detector_points("2026-09-27T14:00:00Z", None)) == [point.raw]
+
+
+def test_materializing_detector_columns_rewrites_only_the_two_columns():
+    client = CaptureClient()
+    RegistryStore(client).materialize_detector_columns()
+    assert [sql for sql, _ in client.statements] == [
+        "ALTER TABLE detector_points MATERIALIZE COLUMN field",
+        "ALTER TABLE detector_points MATERIALIZE COLUMN value",
+    ]

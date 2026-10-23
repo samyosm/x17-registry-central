@@ -40,9 +40,9 @@ class ClickHouseClient:
             method="POST",
         )
 
-    def _open(self, request: Request) -> Any:
+    def _open(self, request: Request, timeout: float | None = None) -> Any:
         try:
-            return urlopen(request, timeout=self.timeout_seconds)
+            return urlopen(request, timeout=timeout or self.timeout_seconds)
         except HTTPError as error:
             detail = error.read(1000).decode("utf-8", errors="replace")
             raise ClickHouseError(f"ClickHouse HTTP {error.code}: {detail}") from error
@@ -57,15 +57,21 @@ class ClickHouseClient:
             response.read()
 
     def query(
-        self, sql: str, params: Mapping[str, str | int] | None = None
+        self,
+        sql: str,
+        params: Mapping[str, str | int] | None = None,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
-        return list(self.iterate(sql, params))
+        return list(self.iterate(sql, params, timeout))
 
     def iterate(
-        self, sql: str, params: Mapping[str, str | int] | None = None
+        self,
+        sql: str,
+        params: Mapping[str, str | int] | None = None,
+        timeout: float | None = None,
     ) -> Iterator[dict[str, Any]]:
         with self._open(
-            self._request(f"{sql} FORMAT JSONEachRow", params, wait_for_end=False)
+            self._request(f"{sql} FORMAT JSONEachRow", params, wait_for_end=False), timeout
         ) as response:
             for line in response:
                 yield json.loads(line)

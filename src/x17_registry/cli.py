@@ -179,6 +179,10 @@ def main() -> None:
         action="store_true",
         help="Forget the saved backfill position first, so it starts again from now.",
     )
+    commands.add_parser(
+        "materialize-detector-columns",
+        help="Rewrite the channel and ADC columns of stored detector points (speeds up analysis).",
+    )
     commands.add_parser("status", help="Print stored checkpoints and poller/backfill status.")
     commands.add_parser(
         "reset-backfill", help="Forget the saved backfill position (no data is deleted)."
@@ -212,7 +216,13 @@ def main() -> None:
         common = CommonSettings()
         store = registry_store(common)
         store.initialize()
-        if command == "status":
+        if command == "materialize-detector-columns":
+            store.materialize_detector_columns()
+            print(
+                "Started in ClickHouse. Progress: SELECT table, command, is_done "
+                "FROM system.mutations WHERE table = 'detector_points'"
+            )
+        elif command == "status":
             show_status(store)
         elif command == "reset-backfill":
             print(json.dumps({"cleared": store.clear_checkpoints(BACKFILL_CHECKPOINT_PREFIX)}))

@@ -22,11 +22,11 @@ class EmbeddedClickHouse:
             sql = token.sub(literal, sql)
         return sql
 
-    def query(self, sql, params=None):
+    def query(self, sql, params=None, timeout=None):
         result = str(self.session.query(self._expand(sql, params), "JSONEachRow"))
         return [json.loads(line) for line in result.splitlines() if line]
 
-    def iterate(self, sql, params=None):
+    def iterate(self, sql, params=None, timeout=None):
         return iter(self.query(sql, params))
 
     def insert(self, table, rows):

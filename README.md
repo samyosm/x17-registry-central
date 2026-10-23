@@ -33,12 +33,23 @@ uv run x17-registry set-checkpoint influx now               # move the forward s
 
 ## Source identification
 
-`GET /identification?from=…&to=…&limit=10000` builds one histogram per scintillator from the first `limit` ADC readings of the period and classifies it with the `x17-isotope-id` library (pairing U and D readings of equal time, template fit). It is off until the library and its templates are set up:
+`GET /identification?from=…&to=…` classifies every scintillator from **all** the readings of the period, and `GET /identification/{scintillator}` shows the data scale behind one result (raw readings, threshold scan, spectrum against the templates). There is no limit on the period or the number of readings.
+
+The work happens inside ClickHouse (`adapters/detector_sql.py`): the readings are paired, filtered with the acquisition threshold of `x17-isotope-id/config.toml` (`[filter]`), and histogrammed there, so only a few hundred counts per scintillator reach the API. The stored points are never changed or removed; the threshold only decides which readings a query uses. On a synthetic table of 48 million readings, the whole-period identification took about 0.4 s with the threshold in `both` mode, and the worst case (threshold disabled, every pair counted) 16 s without using the temporary disk.
+
+Set it up:
 
 ```sh
-uv sync --locked --extra isotope      # installs ../x17-isotope-id
+uv sync --locked --extra isotope      # installs ../x17-isotope-id (editable)
 ```
 
-Build the templates in `x17-isotope-id` (`python scripts/initialize.py`), then set `X17_ISOTOPE_ID_CONFIG` to its `config.toml`. Without them the endpoint answers 503 `identifier_unavailable`. No calibration is applied yet.
+Build the templates in `x17-isotope-id` (`uv run --group scripts python scripts/initialize.py`), then set `X17_ISOTOPE_ID_CONFIG` to its `config.toml`. Without them the endpoints answer 503 `identifier_unavailable`. Restart `x17-registry serve` after changing the library, its config or the templates. All templates must use the same bins.
 
-The library is installed in editable mode, so the registry always runs the code in `../x17-isotope-id`. Restart `x17-registry serve` after changing it. After pulling this change once, run `uv sync --locked --extra isotope` to switch an existing environment from the old copy to the link.
+Starting the API adds two stored columns to `detector_points`, `field` and `value` (the channel and ADC value of each point, derived from its JSON). Nothing is deleted. Rows stored before that are computed from the JSON when queried, which is already fast; to make them faster still (about 10×), rewrite the two columns once, in the background:
+
+```sh
+uv run x17-registry materialize-detector-columns
+# progress: SELECT table, command, is_done FROM system.mutations WHERE table = 'detector_points'
+```
+
+`X17_IDENTIFICATION_TIMEOUT_SECONDS` (default 280) is how long one ClickHouse query of these endpoints may run; keep it below the 290 s the website waits.
