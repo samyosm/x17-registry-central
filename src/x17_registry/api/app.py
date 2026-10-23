@@ -17,6 +17,13 @@ from x17_registry.adapters.clickhouse import ClickHouseClient, ClickHouseError
 from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.beam import beam_context
 from x17_registry.application.channels import PMT_CHANNELS
+from x17_registry.application.identification import (
+    MAX_READINGS,
+    Identifier,
+    IdentifierUnavailable,
+    identify_readings,
+    load_identifier,
+)
 from x17_registry.config import Settings
 
 
@@ -357,6 +364,60 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "channels": sorted(
                 series.values(), key=lambda item: (item["end"], int(item["channel"][1:]))
             ),
+        }
+
+    identifier: list[Identifier] = []
+
+    @api.get("/identification")
+    def identification(
+        from_time: Annotated[datetime, Query(alias="from")],
+        to_time: Annotated[datetime, Query(alias="to")],
+        limit: int = Query(10_000, ge=100, le=MAX_READINGS),
+    ) -> Any:
+        """Identify the source near each scintillator from one histogram of the period.
+
+        Uses the first `limit` ADC readings of [from, to).
+        """
+        start = from_time if from_time.tzinfo else from_time.replace(tzinfo=UTC)
+        end = to_time if to_time.tzinfo else to_time.replace(tzinfo=UTC)
+        if start >= end:
+            raise HTTPException(400, "from must be before to")
+        if not identifier:
+            try:
+                identifier.append(load_identifier(str(settings.isotope_id_config or "")))
+            except IdentifierUnavailable as error:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"code": "identifier_unavailable", "message": str(error)}},
+                )
+        start_ns = int(start.timestamp()) * 1_000_000_000 + start.microsecond * 1_000
+        end_ns = int(end.timestamp()) * 1_000_000_000 + end.microsecond * 1_000
+        rows = registry.detector_readings(start_ns, end_ns, limit + 1)
+        truncated = len(rows) > limit
+        rows = rows[:limit]
+        results = identify_readings(identifier[0], rows)
+        return {
+            "from": registry._event_at(start_ns),
+            "to": registry._event_at(end_ns),
+            "limit": limit,
+            "readings": len(rows),
+            "truncated": truncated,
+            "readingsUntil": registry._event_at(int(rows[-1]["event_ns"])) if rows else None,
+            "threshold": identifier[0].threshold,
+            "minPairs": identifier[0].min_pairs,
+            "scintillators": [
+                {
+                    "scintillator": item["group"],
+                    "pairs": item["pairs"],
+                    "pairsInRange": item["in_range"],
+                    "verdict": item["label"],
+                    "best": item["best"],
+                    "fraction": item["fraction"],
+                    "delta": item["delta"],
+                    "margin": item["margin"],
+                }
+                for item in results
+            ],
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:

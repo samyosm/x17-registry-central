@@ -346,6 +346,19 @@ class RegistryStore:
             {"start": start_ns, "end": end_ns, "width": width_ns},
         )
 
+    def detector_readings(self, start_ns: int, end_ns: int, limit: int) -> list[dict[str, Any]]:
+        """The first `limit` ADC readings (event_ns, field, value) in [start, end), by time."""
+        return self.client.query(
+            "SELECT event_ns, field, value "
+            "FROM (SELECT event_ns, "
+            "JSONExtractString(point_json,'_field') AS field, "
+            "toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value'))) AS value "
+            "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64}) "
+            "WHERE value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
+            "ORDER BY event_ns LIMIT {limit:UInt32}",
+            {"start": start_ns, "end": end_ns, "limit": limit},
+        )
+
     def iter_detector_points(self, start: str, end: str | None) -> Iterator[dict[str, Any]]:
         condition, params = self._interval(start, end)
         for row in self.client.iterate(

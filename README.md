@@ -30,3 +30,15 @@ uv run x17-registry set-checkpoint influx now               # move the forward s
 ```
 
 `backfill-influx` resumes where it stopped unless `--restart` is given. `set-checkpoint` accepts an ISO time or `now` and only for checkpoints that exist.
+
+## Source identification
+
+`GET /identification?from=…&to=…&limit=10000` builds one histogram per scintillator from the first `limit` ADC readings of the period and classifies it with the `x17-isotope-id` library (pairing U and D readings of equal time, template fit). It is off until the library and its templates are set up:
+
+```sh
+uv sync --locked --extra isotope      # installs ../x17-isotope-id
+```
+
+Build the templates in `x17-isotope-id` (`python scripts/initialize.py`), then set `X17_ISOTOPE_ID_CONFIG` to its `config.toml`. Without them the endpoint answers 503 `identifier_unavailable`. No calibration is applied yet.
+
+The library is installed as a copy, not linked: after changing `x17-isotope-id`, run `uv sync --reinstall-package x17-isotope-id --extra isotope` (or add `--reinstall-package x17-isotope-id` to `uv run`).

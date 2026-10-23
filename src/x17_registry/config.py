@@ -23,6 +23,12 @@ class Settings(CommonSettings):
     api_token: SecretStr
     page_size: int = Field(gt=0)
     max_page_size: int = Field(gt=0)
+    isotope_id_config: Path | None = None
+
+    @field_validator("isotope_id_config", mode="before")
+    @classmethod
+    def empty_isotope_id_config(cls, value: object) -> object:
+        return None if value == "" else value
 
     @field_validator("api_prefix")
     @classmethod
