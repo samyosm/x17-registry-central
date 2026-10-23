@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
@@ -220,32 +221,6 @@ def test_calibration_converts_the_real_values_for_the_simulation(make_identifier
     assert uncalibrated.config["filter"]["simulation_threshold"] == 20.0
 
 
-def test_identification_covers_the_whole_period(isotope_client, store):
-    rng = np.random.default_rng(1)
-    shape = shapes()
-    cesium = rng.choice(CENTERS, size=2000, p=shape["Cs-137"] / shape["Cs-137"].sum())
-    muons = rng.choice(CENTERS, size=50, p=shape["cosmic-muons"] / shape["cosmic-muons"].sum())
-    store.save_detector_batch(
-        pair_points(*GROUPS["0"], [float(v) for v in cesium], "cs")
-        + pair_points(*GROUPS["15"], [float(v) for v in muons], "mu")
-    )
-    body = isotope_client.get("/api/v1/identification", params=PARAMS).json()
-    assert body["readings"] == 4100
-    assert body["filter"]["enabled"] is False
-    rows = {item["scintillator"]: item for item in body["scintillators"]}
-    assert len(rows) == 16
-    assert rows["0"]["pairs"] == 2000
-    assert rows["0"]["verdict"] == "Cs-137"
-    assert rows["15"]["pairs"] == 50
-    assert rows["15"]["verdict"] is None
-    assert rows["1"]["pairs"] == 0
-    assert "limit" not in body
-    backwards = isotope_client.get(
-        "/api/v1/identification", params={"from": PARAMS["to"], "to": PARAMS["from"]}
-    )
-    assert backwards.status_code == 400
-
-
 def test_diagnostics_show_a_scale_mismatch(isotope_client, store):
     rng = np.random.default_rng(2)
     shape = shapes()["cosmic-muons"]
@@ -280,3 +255,191 @@ def test_identification_unavailable_without_config(client):
     response = client.get("/api/v1/identification", params=PARAMS)
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "identifier_unavailable"
+
+
+# --- identification by excess over a reference period ------------------------------------------
+
+BINS, TOP = 20, 40.0  # 2 ADC per bin up to 40 ADC in the tests
+BAD_FIELDS = ["FPGA2_ADCG", "FPGA2_ADCH", "FPGA2_ADCF"]
+EVENT_STEP_NS = 1_000_000  # one event per millisecond
+
+
+def write_excess_config(directory):
+    """A config with an [excess] section and two invented source shapes: "Soft" and "Hard"."""
+    from x17_registry.application.channels import PMT_CHANNELS
+
+    centres = (np.arange(BINS) + 0.5) * TOP / BINS
+    # like the real shapes, nothing below the selection (both PMTs at or above 8)
+    soft = np.where(centres >= 8, np.exp(-(centres - 8.0) / 8.0), 0.0)
+    hard = np.where(centres >= 8, np.exp(-0.5 * ((centres - 26.0) / 6.0) ** 2) + 0.05, 0.0)
+    shapes = {
+        name: {"shapes": {str(c): {str(b): (shape / shape.sum()).tolist() for b in range(16)}
+                          for c in range(9)}}
+        for name, shape in (("Soft", soft), ("Hard", hard))
+    }
+    (directory / "templates.json").write_text(json.dumps({"sources": shapes}))
+    pedestals = "\n".join(f"{field} = 0.0" for field in PMT_CHANNELS)
+    path = directory / "config.toml"
+    path.write_text(f"""
+[excess]
+threshold = 8
+bins = {BINS}
+max = {TOP}
+templates = "templates.json"
+detection_ts = 30.0
+margin_ts = 9.0
+min_events = 200
+min_plausible_activity_bq = 1000
+bad_channels = {json.dumps(BAD_FIELDS)}
+[excess.activity_bq]
+"Soft" = 1000000.0
+"Hard" = 1000000.0
+[excess.pedestals]
+{pedestals}
+""")
+    return path
+
+
+def stamp_of(ns):
+    moment = START + timedelta(microseconds=(ns - START_NS) // 1000)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def events(rng, start_index, count, source_rate=0.0, source_bars=(3, 4), shape="Soft"):
+    """`count` events: noise on bars 2 to 5, a trigger number, and in some events a source."""
+    points, at = [], START_NS + start_index * EVENT_STEP_NS
+    for index in range(count):
+        t = at + index * EVENT_STEP_NS
+        stamp = stamp_of(t)
+        points.append(reading(f"n{t}", stamp, "trignum", float(start_index + index)))
+        for bar in (2, 3, 4, 5):
+            d_field, u_field = GROUPS[str(bar)]
+            hit = rng.random() < source_rate * (1.0 if bar in source_bars else 0.0)
+            if hit:  # a source pulse: soft (exponential) or hard (around 26 ADC) in both PMTs
+                v = rng.exponential(8.0) + 8 if shape == "Soft" else rng.normal(26, 5)
+                d, u = v * rng.uniform(0.9, 1.1), v * rng.uniform(0.9, 1.1)
+            elif rng.random() < 0.03:  # a noise pair just above the threshold
+                d, u = rng.uniform(8, 14), rng.uniform(8, 14)
+            else:
+                d, u = rng.integers(0, 6), rng.integers(0, 6)
+            points.append(reading(f"{t}-{bar}-d", stamp, d_field, float(d)))
+            points.append(reading(f"{t}-{bar}-u", stamp, u_field, float(u)))
+    return points
+
+
+@pytest.fixture
+def excess_client(tmp_path, store):
+    from conftest import server_settings
+    from fastapi.testclient import TestClient
+
+    from x17_registry.api.app import create_app
+
+    settings = server_settings(store.client.database).model_copy(
+        update={"isotope_id_config": write_excess_config(tmp_path)}
+    )
+    with TestClient(create_app(settings, store)) as result:
+        result.headers["Authorization"] = "Bearer test-token"
+        yield result
+
+
+def iso_of(index):
+    return stamp_of(START_NS + index * EVENT_STEP_NS)
+
+
+def test_excess_finds_the_source_and_its_bar(excess_client, store):
+    rng = np.random.default_rng(5)
+    # reference: events 0-3999, no source; window: events 4000-5999, a soft source on bars 3 and 4
+    store.save_detector_batch(events(rng, 0, 4000) + events(rng, 4000, 2000, source_rate=0.10))
+    body = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(4000), "to": iso_of(6000)}
+    ).json()
+    assert body["reference"]["mode"] == "before"
+    assert body["events"]["window"] == 2000 and body["reference"]["events"] == 4000
+    assert body["events"]["scale"] == pytest.approx(0.5)
+    bars = {item["scintillator"]: item for item in body["bars"]}
+    assert len(bars) == 16
+    assert bars["3"]["z"] > 5 and bars["4"]["z"] > 5
+    assert abs(bars["2"]["z"]) < 4 and abs(bars["5"]["z"]) < 4
+    assert [bars[str(b)]["usable"] for b in (9, 10, 11)] == [False, False, False]
+    assert bars["9"]["reason"].startswith("PMT")
+    assert body["verdict"]["code"] in ("identified", "detected")
+    assert "Soft" in (body["verdict"]["candidates"] + [body["verdict"]["source"]])
+    assert body["verdict"]["source"] in ("Soft", None)
+    assert body["verdict"]["centre"] in (3, 4)
+    assert body["sources"][0]["name"] == "Soft"
+    assert body["sources"][0]["ts"] > body["sources"][1]["ts"]
+    assert body["detection"]["rateZ"] > 8
+    assert len(body["spectrum"]["window"]) == BINS
+
+
+def test_excess_names_the_hard_source_and_says_none_without_a_source(excess_client, store):
+    rng = np.random.default_rng(6)
+    store.save_detector_batch(
+        events(rng, 0, 4000)
+        + events(rng, 4000, 2000, source_rate=0.15, shape="Hard")
+        + events(rng, 6000, 2000)
+    )
+    hard = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(4000), "to": iso_of(6000)}
+    ).json()
+    assert hard["sources"][0]["name"] == "Hard"
+    assert hard["verdict"]["code"] in ("identified", "detected")
+    quiet = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(6000), "to": iso_of(8000)}
+    ).json()
+    assert quiet["verdict"]["code"] == "none"
+    assert quiet["verdict"]["centre"] is None
+    assert quiet["detection"]["rateZ"] < 4
+
+
+def test_excess_reference_rules_and_errors(excess_client, store):
+    rng = np.random.default_rng(7)
+    store.save_detector_batch(events(rng, 0, 3000) + events(rng, 3000, 1000, source_rate=0.1))
+    window = {"from": iso_of(0), "to": iso_of(1000)}
+    # nothing before the window: the period after is used
+    after = excess_client.get("/api/v1/identification", params=window).json()
+    assert after["reference"]["mode"] == "after"
+    assert after["reference"]["events"] >= 2000
+    # a custom reference, and its errors
+    custom = excess_client.get(
+        "/api/v1/identification", params=window | {"refFrom": iso_of(1000), "refTo": iso_of(3000)}
+    )
+    assert custom.status_code == 200 and custom.json()["reference"]["mode"] == "custom"
+    overlap = excess_client.get(
+        "/api/v1/identification", params=window | {"refFrom": iso_of(500), "refTo": iso_of(2000)}
+    )
+    assert overlap.status_code == 400
+    one = excess_client.get("/api/v1/identification", params=window | {"refFrom": iso_of(1000)})
+    assert one.status_code == 400
+    backwards = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(1000), "to": iso_of(0)}
+    )
+    assert backwards.status_code == 400
+    # too few events in the window
+    few = excess_client.get(
+        "/api/v1/identification",
+        params={
+            "from": iso_of(0), "to": iso_of(50), "refFrom": iso_of(1000), "refTo": iso_of(3000),
+        },
+    )
+    assert few.status_code == 422
+    assert few.json()["error"]["code"] == "insufficient_data"
+
+
+def test_excess_warns_when_the_event_rate_changed(excess_client, store):
+    rng = np.random.default_rng(8)
+    # the reference has half the event rate of the window: the trigger configuration changed
+    sparse = [p for i, p in enumerate(events(rng, 0, 2000)) if (i // 9) % 2 == 0]
+    store.save_detector_batch(sparse + events(rng, 2000, 2000))
+    body = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(2000), "to": iso_of(4000)}
+    ).json()
+    assert any("event rate differs" in warning for warning in body["warnings"])
+
+
+def test_excess_unavailable_without_the_section(isotope_client):
+    # the default test config has no [excess] section
+    response = isotope_client.get("/api/v1/identification", params=PARAMS)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "identifier_unavailable"
+    assert "excess" in response.json()["error"]["message"]

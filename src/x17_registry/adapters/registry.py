@@ -364,6 +364,20 @@ class RegistryStore:
         rows = self.client.query(detector_sql.readings_sql(start_ns, end_ns), timeout=timeout)
         return int(rows[0]["n"])
 
+    def count_events(self, start_ns: int, end_ns: int, timeout: float | None = None) -> int:
+        """The triggers (events) in [start, end): the exposure of a random-trigger acquisition."""
+        return self.event_span(start_ns, end_ns, timeout)[0]
+
+    def event_span(
+        self, start_ns: int, end_ns: int, timeout: float | None = None
+    ) -> tuple[int, float]:
+        """(triggers, seconds from the first to the last): the rate is over the time with data."""
+        rows = self.client.query(detector_sql.events_sql(start_ns, end_ns), timeout=timeout)
+        count = int(rows[0]["n"])
+        if count < 2:
+            return count, 0.0
+        return count, (int(rows[0]["t_last"]) - int(rows[0]["t_first"])) / 1e9
+
     def pair_histograms(
         self,
         spec: detector_sql.PairSpec,

@@ -198,6 +198,16 @@ def raw_histogram_sql(
     )
 
 
+def events_sql(start_ns: int, end_ns: int) -> str:
+    """The triggers (events) in a period: their number (distinct times of the trigger numbers)
+    and the first and last time."""
+    return (
+        "SELECT uniqExact(event_ns) AS n, min(event_ns) AS t_first, max(event_ns) AS t_last "
+        "FROM detector_points "
+        f"WHERE {interval(start_ns, end_ns)} AND field = 'trignum'"
+    )
+
+
 def readings_sql(start_ns: int, end_ns: int) -> str:
     return f"SELECT count() AS n FROM detector_points WHERE {interval(start_ns, end_ns)}"
 

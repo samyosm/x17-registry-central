@@ -20,8 +20,11 @@ from x17_registry.application.channels import PMT_CHANNELS
 from x17_registry.application.identification import (
     Identifier,
     IdentifierUnavailable,
+    InsufficientData,
     diagnose_period,
-    identify_period,
+    excess_analyzer,
+    excess_response,
+    identify_excess_period,
     load_identifier,
 )
 from x17_registry.config import Settings
@@ -390,43 +393,64 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             content={"error": {"code": "identifier_unavailable", "message": str(error)}},
         )
 
-    def filter_summary(model: Identifier) -> dict[str, Any]:
-        return {
-            "enabled": bool(model.filter["enabled"]),
-            "mode": str(model.filter["mode"]),
-            "threshold": float(model.filter["threshold"]),
-        }
+    @app.exception_handler(InsufficientData)
+    async def insufficient_data(request: Request, error: InsufficientData) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "insufficient_data", "message": str(error)}},
+        )
+
+    def nanoseconds(moment: datetime) -> int:
+        moment = moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+        return int(moment.timestamp()) * 1_000_000_000 + moment.microsecond * 1_000
 
     @api.get("/identification")
     def identification(
         from_time: Annotated[datetime, Query(alias="from")],
         to_time: Annotated[datetime, Query(alias="to")],
+        ref_from: Annotated[datetime | None, Query(alias="refFrom")] = None,
+        ref_to: Annotated[datetime | None, Query(alias="refTo")] = None,
     ) -> Any:
-        """Identify the source near each scintillator from one histogram of the whole period."""
+        """Look for a source in [from, to) as an excess over a reference period.
+
+        The reference is [refFrom, refTo) if given, otherwise the 24 hours (or as long as the
+        window) before the window, or after it if the period before holds too little data.
+        """
         model, start_ns, end_ns = identification_input(from_time, to_time)
         timeout = settings.identification_timeout_seconds
-        results = identify_period(registry, model, start_ns, end_ns, timeout)
-        return {
-            "from": registry._event_at(start_ns),
-            "to": registry._event_at(end_ns),
-            "readings": registry.count_readings(start_ns, end_ns, timeout),
-            "threshold": model.threshold,
-            "minPairs": model.min_pairs,
-            "filter": filter_summary(model),
-            "scintillators": [
-                {
-                    "scintillator": item["group"],
-                    "pairs": item["pairs"],
-                    "pairsInRange": item["in_range"],
-                    "verdict": item["label"],
-                    "best": item["best"],
-                    "fraction": item["fraction"],
-                    "delta": item["delta"],
-                    "margin": item["margin"],
-                }
-                for item in results
-            ],
-        }
+        analyzer = excess_analyzer(model)
+        if (ref_from is None) != (ref_to is None):
+            raise HTTPException(400, "refFrom and refTo go together")
+        if ref_from is not None and ref_to is not None:
+            mode, ref_start, ref_end = "custom", nanoseconds(ref_from), nanoseconds(ref_to)
+            if ref_start >= ref_end:
+                raise HTTPException(400, "refFrom must be before refTo")
+            if ref_start < end_ns and ref_end > start_ns:
+                raise HTTPException(400, "The reference must not overlap the window")
+        else:
+            length = max(end_ns - start_ns, 86_400 * 1_000_000_000)
+            options = (("before", start_ns - length, start_ns), ("after", end_ns, end_ns + length))
+            mode, ref_start, ref_end = next(
+                (
+                    option
+                    for option in options
+                    if registry.count_events(option[1], option[2], timeout) >= analyzer.min_events
+                ),
+                options[0],
+            )
+        result = identify_excess_period(
+            registry, model, (start_ns, end_ns), (ref_start, ref_end), timeout
+        )
+        return excess_response(
+            result,
+            {
+                "window": (registry._event_at(start_ns), registry._event_at(end_ns)),
+                "reference": (registry._event_at(ref_start), registry._event_at(ref_end)),
+                "durations": ((end_ns - start_ns) / 1e9, (ref_end - ref_start) / 1e9),
+                "mode": mode,
+            },
+            analyzer,
+        )
 
     @api.get("/identification/{scintillator}")
     def identification_diagnostics(
