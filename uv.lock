@@ -1034,7 +1034,7 @@ wheels = [
 [[package]]
 name = "x17-isotope-id"
 version = "0.1.0"
-source = { directory = "../x17-isotope-id" }
+source = { editable = "../x17-isotope-id" }
 dependencies = [
     { name = "numpy" },
     { name = "scipy" },
@@ -1093,7 +1093,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.7,<3" },
     { name = "pyzmq", specifier = ">=26,<28" },
     { name = "uvicorn", specifier = ">=0.34,<1" },
-    { name = "x17-isotope-id", marker = "extra == 'isotope'", directory = "../x17-isotope-id" },
+    { name = "x17-isotope-id", marker = "extra == 'isotope'", editable = "../x17-isotope-id" },
 ]
 provides-extras = ["isotope"]
 

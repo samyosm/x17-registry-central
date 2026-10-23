@@ -41,4 +41,4 @@ uv sync --locked --extra isotope      # installs ../x17-isotope-id
 
 Build the templates in `x17-isotope-id` (`python scripts/initialize.py`), then set `X17_ISOTOPE_ID_CONFIG` to its `config.toml`. Without them the endpoint answers 503 `identifier_unavailable`. No calibration is applied yet.
 
-The library is installed as a copy, not linked: after changing `x17-isotope-id`, run `uv sync --reinstall-package x17-isotope-id --extra isotope` (or add `--reinstall-package x17-isotope-id` to `uv run`).
+The library is installed in editable mode, so the registry always runs the code in `../x17-isotope-id`. Restart `x17-registry serve` after changing it. After pulling this change once, run `uv sync --locked --extra isotope` to switch an existing environment from the old copy to the link.
