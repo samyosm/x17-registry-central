@@ -18,9 +18,9 @@ from x17_registry.adapters.registry import RegistryStore
 from x17_registry.application.beam import beam_context
 from x17_registry.application.channels import PMT_CHANNELS
 from x17_registry.application.identification import (
-    MAX_READINGS,
     Identifier,
     IdentifierUnavailable,
+    diagnose_readings,
     identify_readings,
     load_identifier,
 )
@@ -368,34 +368,43 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
 
     identifier: list[Identifier] = []
 
-    @api.get("/identification")
-    def identification(
-        from_time: Annotated[datetime, Query(alias="from")],
-        to_time: Annotated[datetime, Query(alias="to")],
-        limit: int = Query(10_000, ge=100, le=MAX_READINGS),
-    ) -> Any:
-        """Identify the source near each scintillator from one histogram of the period.
-
-        Uses the first `limit` ADC readings of [from, to).
-        """
+    def identification_input(
+        from_time: datetime, to_time: datetime, limit: int
+    ) -> tuple[Identifier, list[dict[str, Any]], bool, int, int]:
         start = from_time if from_time.tzinfo else from_time.replace(tzinfo=UTC)
         end = to_time if to_time.tzinfo else to_time.replace(tzinfo=UTC)
         if start >= end:
             raise HTTPException(400, "from must be before to")
         if not identifier:
-            try:
-                identifier.append(load_identifier(str(settings.isotope_id_config or "")))
-            except IdentifierUnavailable as error:
-                return JSONResponse(
-                    status_code=503,
-                    content={"error": {"code": "identifier_unavailable", "message": str(error)}},
-                )
+            identifier.append(load_identifier(str(settings.isotope_id_config or "")))
         start_ns = int(start.timestamp()) * 1_000_000_000 + start.microsecond * 1_000
         end_ns = int(end.timestamp()) * 1_000_000_000 + end.microsecond * 1_000
         rows = registry.detector_readings(start_ns, end_ns, limit + 1)
-        truncated = len(rows) > limit
-        rows = rows[:limit]
-        results = identify_readings(identifier[0], rows)
+        return identifier[0], rows[:limit], len(rows) > limit, start_ns, end_ns
+
+    @app.exception_handler(IdentifierUnavailable)
+    async def identifier_unavailable(
+        request: Request, error: IdentifierUnavailable
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "identifier_unavailable", "message": str(error)}},
+        )
+
+    @api.get("/identification")
+    def identification(
+        from_time: Annotated[datetime, Query(alias="from")],
+        to_time: Annotated[datetime, Query(alias="to")],
+        limit: int = Query(10_000, ge=100),
+    ) -> Any:
+        """Identify the source near each scintillator from one histogram of the period.
+
+        Uses the first `limit` ADC readings of [from, to).
+        """
+        model, rows, truncated, start_ns, end_ns = identification_input(
+            from_time, to_time, limit
+        )
+        results = identify_readings(model, rows)
         return {
             "from": registry._event_at(start_ns),
             "to": registry._event_at(end_ns),
@@ -403,8 +412,8 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "readings": len(rows),
             "truncated": truncated,
             "readingsUntil": registry._event_at(int(rows[-1]["event_ns"])) if rows else None,
-            "threshold": identifier[0].threshold,
-            "minPairs": identifier[0].min_pairs,
+            "threshold": model.threshold,
+            "minPairs": model.min_pairs,
             "scintillators": [
                 {
                     "scintillator": item["group"],
@@ -418,6 +427,31 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
                 }
                 for item in results
             ],
+        }
+
+    @api.get("/identification/{scintillator}")
+    def identification_diagnostics(
+        scintillator: str,
+        from_time: Annotated[datetime, Query(alias="from")],
+        to_time: Annotated[datetime, Query(alias="to")],
+        limit: int = Query(10_000, ge=100),
+    ) -> Any:
+        """Data scale of one scintillator against the templates, for the same readings."""
+        model, rows, truncated, start_ns, end_ns = identification_input(
+            from_time, to_time, limit
+        )
+        result = diagnose_readings(model, rows, scintillator)
+        if result is None:
+            raise HTTPException(404, "Scintillator not found")
+        return {
+            "scintillator": scintillator,
+            "from": registry._event_at(start_ns),
+            "to": registry._event_at(end_ns),
+            "limit": limit,
+            "readings": len(rows),
+            "truncated": truncated,
+            "threshold": model.threshold,
+            **result,
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:

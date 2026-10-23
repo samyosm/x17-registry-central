@@ -5,8 +5,6 @@ import numpy as np
 
 from x17_registry.application.channels import PMT_CHANNELS
 
-MAX_READINGS = 200_000
-
 
 class IdentifierUnavailable(RuntimeError):
     pass
@@ -23,6 +21,10 @@ class Identifier(Protocol):
         adc: Any,
         groups: Mapping[str, tuple[str, str]],
     ) -> list[dict[str, Any]]: ...
+
+    def diagnose(
+        self, times: Any, fields: Any, adc: Any, d_field: str, u_field: str
+    ) -> dict[str, Any]: ...
 
 
 def scintillator_groups() -> dict[str, tuple[str, str]]:
@@ -54,11 +56,25 @@ def load_identifier(config_path: str | None) -> Identifier:
         ) from error
 
 
+def reading_arrays(readings: list[dict[str, Any]]) -> tuple[Any, Any, Any]:
+    times = np.array([int(row["event_ns"]) for row in readings], dtype=np.int64)
+    fields = np.array([row["field"] for row in readings], dtype=str)
+    adc = np.array([float(row["value"]) for row in readings], dtype=np.float64)
+    return times, fields, adc
+
+
 def identify_readings(
     identifier: Identifier, readings: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     """One result per scintillator from rows of {event_ns, field, value}."""
-    times = np.array([int(row["event_ns"]) for row in readings], dtype=np.int64)
-    fields = np.array([row["field"] for row in readings], dtype=str)
-    adc = np.array([float(row["value"]) for row in readings], dtype=np.float64)
-    return identifier.identify(times, fields, adc, scintillator_groups())
+    return identifier.identify(*reading_arrays(readings), scintillator_groups())
+
+
+def diagnose_readings(
+    identifier: Identifier, readings: list[dict[str, Any]], scintillator: str
+) -> dict[str, Any] | None:
+    """Data-scale diagnostics of one scintillator; None if the scintillator is unknown."""
+    pair = scintillator_groups().get(scintillator)
+    if pair is None:
+        return None
+    return identifier.diagnose(*reading_arrays(readings), *pair)

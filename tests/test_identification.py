@@ -106,6 +106,11 @@ def test_identification_limit_truncates_and_validates(isotope_client, store):
     assert body["readings"] == 200
     rows = {item["scintillator"]: item for item in body["scintillators"]}
     assert rows["0"]["pairs"] == 100
+    unlimited = isotope_client.get(
+        "/api/v1/identification", params=PARAMS | {"limit": 10_000_000_000}
+    ).json()
+    assert unlimited["truncated"] is False
+    assert unlimited["readings"] == 600
     backwards = isotope_client.get(
         "/api/v1/identification", params={"from": PARAMS["to"], "to": PARAMS["from"]}
     )
@@ -118,3 +123,41 @@ def test_identification_unavailable_without_config(client):
     response = client.get("/api/v1/identification", params=PARAMS)
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "identifier_unavailable"
+
+
+def test_diagnostics_show_a_scale_mismatch(isotope_client, store):
+    rng = np.random.default_rng(2)
+    shape = shapes()["cosmic-muons"]
+    muons = rng.choice(CENTERS, size=3000, p=shape / shape.sum())
+    # Data stored 10x larger than the templates, one D reading never paired.
+    values = [float(v) * 10 for v in muons]
+    store.save_detector_batch(
+        pair_points("FPGA0_ADCA", "FPGA2_ADCA", values, "big")
+        + [
+            SourceRecord(
+                "influx",
+                "test-influx",
+                "alone",
+                {
+                    "_time": "2026-09-27T14:02:00.000000Z",
+                    "_measurement": "run_80",
+                    "_field": "FPGA0_ADCA",
+                    "_value": 5.0,
+                },
+                "2026-09-27T14:02:00.000000Z",
+                "80",
+            )
+        ]
+    )
+    body = isotope_client.get(
+        "/api/v1/identification/0", params=PARAMS | {"limit": 100_000}
+    ).json()
+    assert body["pairs"] == 3000
+    assert body["unpaired"] == 1
+    assert body["above"] > 1500
+    assert 8 < body["scale"] < 12
+    assert body["d"]["n"] == 3001
+    assert len(body["observed"]) == len(body["muon"]) == 200
+    assert body["fit"]["isotope"] in {"Cs-137"}
+    missing = isotope_client.get("/api/v1/identification/99", params=PARAMS)
+    assert missing.status_code == 404

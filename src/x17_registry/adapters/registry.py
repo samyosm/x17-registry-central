@@ -355,7 +355,7 @@ class RegistryStore:
             "toFloat64OrNull(trim(BOTH '\"' FROM JSONExtractRaw(point_json,'_value'))) AS value "
             "FROM detector_points FINAL WHERE event_ns>={start:Int64} AND event_ns<{end:Int64}) "
             "WHERE value IS NOT NULL AND startsWith(field,'FPGA') AND position(field,'_ADC')>0 "
-            "ORDER BY event_ns LIMIT {limit:UInt32}",
+            "ORDER BY event_ns LIMIT {limit:UInt64}",
             {"start": start_ns, "end": end_ns, "limit": limit},
         )
 
