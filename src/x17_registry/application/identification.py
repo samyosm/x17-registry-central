@@ -21,6 +21,8 @@ class Identifier(Protocol):
 
     def pedestal(self, field: str) -> float: ...
 
+    def scale(self, group: str | None = None) -> float: ...
+
     def bin_layout(self) -> tuple[float, float, int]: ...
 
     def identify_histograms(
@@ -38,6 +40,7 @@ class Identifier(Protocol):
         above: int,
         zero: int,
         raw: dict[str, Any] | None = None,
+        group: str | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -83,6 +86,7 @@ def pair_spec(identifier: Identifier) -> PairSpec:
         filter_mode=str(identifier.filter["mode"]),
         filter_threshold=float(identifier.filter["threshold"]),
         pedestals={field: identifier.pedestal(field) for pair in groups.values() for field in pair},
+        scales={name: identifier.scale(name) for name in groups},
     )
 
 
@@ -114,4 +118,4 @@ def diagnose_period(
         spec, scintillator, start_ns, end_ns, identifier.raw_start, identifier.raw_bins, timeout
     )
     scan = inputs.pop("scan")
-    return identifier.diagnose_histogram(**inputs) | {"scan": scan}
+    return identifier.diagnose_histogram(**inputs, group=scintillator) | {"scan": scan}

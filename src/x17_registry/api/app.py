@@ -446,8 +446,17 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
             "to": registry._event_at(end_ns),
             "readings": registry.count_readings(start_ns, end_ns, timeout),
             "threshold": model.threshold,
-            **{key: value for key, value in result.items() if key != "template_median"},
+            **{
+                key: value
+                for key, value in result.items()
+                if key not in ("template_median", "calibration")
+            },
             "templateMedian": result["template_median"],
+            "calibration": {
+                "kevPerUnit": result["calibration"]["kev_per_unit"],
+                "gamma": result["calibration"]["gamma"],
+                "factor": result["calibration"]["factor"],
+            },
         }
 
     def find_run(identity: str) -> tuple[dict[str, Any], str | None]:

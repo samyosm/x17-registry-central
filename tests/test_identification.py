@@ -134,10 +134,15 @@ def noisy_readings(rng):
 
 
 PEDESTALS = '[channels.FPGA0_ADCA]\npedestal = 3.0\n[channels.FPGA2_ADCA]\npedestal = 5.0\n'
+CALIBRATION = (
+    "[calibration]\nkev_per_template_unit = 40.0\n[calibration.gamma]\n0 = 20.0\n1 = 25.0\n"
+)
 FILTERS = {
     "disabled": "",
     "both": FILTERED,
     "either": '[filter]\nenabled = true\nmode = "either"\nthreshold = 20\n',
+    "both, calibrated": FILTERED + CALIBRATION,
+    "disabled, calibrated": CALIBRATION,
 }
 
 
@@ -151,14 +156,15 @@ def test_database_histograms_equal_the_python_ones(make_identifier, store, name)
     from_database = store.pair_histograms(spec, START_NS, END_NS)
     assert sum(pairs for _, pairs in from_database.values()) > 0
     for number in GROUPS:
-        values, _ = identifier.pair_values(times, fields, adc, *GROUPS[number])
+        values, _ = identifier.pair_values(times, fields, adc, *GROUPS[number], number)
         counts, pairs = from_database[number]
         assert counts == np.histogram(values, bins=identifier.edges)[0].tolist()
         assert pairs == len(values)
 
 
-def test_database_diagnostics_equal_the_python_ones(make_identifier, store):
-    identifier = make_identifier(FILTERED + PEDESTALS)
+@pytest.mark.parametrize("calibration", ["", CALIBRATION])
+def test_database_diagnostics_equal_the_python_ones(make_identifier, store, calibration):
+    identifier = make_identifier(FILTERED + PEDESTALS + calibration)
     points, times, fields, adc = noisy_readings(np.random.default_rng(4))
     store.save_detector_batch(points)
 
@@ -166,21 +172,52 @@ def test_database_diagnostics_equal_the_python_ones(make_identifier, store):
     inputs = store.pair_diagnostics(
         spec, "1", START_NS, END_NS, identifier.raw_start, identifier.raw_bins
     )
-    expected = identifier.diagnose(times, fields, adc, *GROUPS["1"])
+    expected = identifier.diagnose(times, fields, adc, *GROUPS["1"], "1")
     scan = inputs.pop("scan")
-    result = identifier.diagnose_histogram(**inputs)
+    result = identifier.diagnose_histogram(**inputs, group="1")
     for key in ("pairs", "matched", "unpaired", "below", "above", "zero", "observed", "raw"):
         assert result[key] == expected[key], key
     for end in ("d", "u"):
         for key in ("n", "negative", "min", "max"):
             assert result[end][key] == expected[end][key], (end, key)
         assert result[end]["p50"] == pytest.approx(expected[end]["p50"], abs=1.5)
+    assert result["calibration"] == expected["calibration"]
     assert result["values"]["n"] == expected["values"]["n"]
     u_raw, d_raw = identifier.matched_pairs(times, fields, adc, *GROUPS["1"])
     assert len(scan["thresholds"]) == len(scan["pairs"]) > 5
     for threshold, pairs in zip(scan["thresholds"], scan["pairs"], strict=True):
         assert pairs == int(np.count_nonzero((d_raw >= threshold) & (u_raw >= threshold)))
     assert result["values"]["p50"] == pytest.approx(expected["values"]["p50"], rel=0.1)
+
+
+def test_calibration_converts_the_real_values_for_the_simulation(make_identifier):
+    import config as isotope_config
+
+    defaults = (
+        "[defaults]\ngain = 1.0\nspe_relative_sigma = 0.5\npedestal = 4.0\n"
+        "electronic_noise_sigma = 2.5\n"
+    )
+    identifier = make_identifier(defaults + FILTERED + PEDESTALS + CALIBRATION)
+    assert identifier.scale("0") == pytest.approx(20.0 / 40.0)
+    assert identifier.scale("1") == pytest.approx(25.0 / 40.0)
+    assert identifier.scale("9") == pytest.approx(22.5 / 40.0)  # unknown: the mean gamma
+    config = identifier.config
+    factor = 22.5 / 40.0
+    assert config["calibration"]["sim_per_adc"] == pytest.approx(factor)
+    # the real pedestal, noise and threshold are given in ADC and simulated in template units
+    assert config["filter"]["simulation_threshold"] == pytest.approx(20.0 * factor)
+    _, _, pedestal, noise = isotope_config.channel_parameters(config, "FPGA0_ADCA")
+    assert pedestal == pytest.approx(3.0 * factor)  # the channel override
+    _, _, pedestal, noise = isotope_config.channel_parameters(config, "FPGA1_ADCC")
+    assert pedestal == pytest.approx(4.0 * factor)  # the default
+    assert noise == pytest.approx(2.5 * factor)
+    # the real side keeps the real values
+    assert identifier.pedestal("FPGA0_ADCA") == 3.0
+    assert identifier.filter["threshold"] == 20
+
+    uncalibrated = make_identifier(FILTERED)
+    assert uncalibrated.scale("0") == 1.0
+    assert uncalibrated.config["filter"]["simulation_threshold"] == 20.0
 
 
 def test_identification_covers_the_whole_period(isotope_client, store):
@@ -233,8 +270,9 @@ def test_diagnostics_show_a_scale_mismatch(isotope_client, store):
     assert set(body) >= {
         "scintillator", "from", "to", "readings", "threshold", "d", "u", "pairs", "matched",
         "filter", "unpaired", "values", "below", "above", "zero", "edges", "observed", "muon",
-        "fit", "templateMedian", "scale", "raw", "scan",
+        "fit", "templateMedian", "scale", "raw", "scan", "calibration",
     }
+    assert set(body["calibration"]) == {"kevPerUnit", "gamma", "factor"}
     assert isotope_client.get("/api/v1/identification/99", params=PARAMS).status_code == 404
 
 

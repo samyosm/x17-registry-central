@@ -16,6 +16,7 @@ as 0), exactly as in x17-isotope-id.
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from typing import Any
 
 # Pairing groups the readings by time, which is the start of the table's sorting key: aggregating
@@ -38,6 +39,8 @@ class PairSpec:
     filter_mode: str
     filter_threshold: float
     pedestals: Mapping[str, float]  # channel -> pedestal
+    # group -> factor on sqrt(U * D), from the calibration of each scintillator
+    scales: Mapping[str, float] = dataclass_field(default_factory=dict)
 
 
 def string(value: str) -> str:
@@ -118,14 +121,16 @@ def pair_sql(spec: PairSpec, names: Sequence[str], start_ns: int, end_ns: int) -
 
 
 def value_sql(spec: PairSpec, names: Sequence[str], start_ns: int, end_ns: int) -> str:
-    """One row per accepted pair: scint and v = sqrt((U - PU) * (D - PD))."""
+    """One row per accepted pair: scint and v = scale * sqrt((U - PU) * (D - PD))."""
     indexes = numbers(range(len(names)))
     d_pedestals = numbers([spec.pedestals.get(spec.groups[n][0], 0.0) for n in names])
     u_pedestals = numbers([spec.pedestals.get(spec.groups[n][1], 0.0) for n in names])
+    scales = numbers([spec.scales.get(n, 1.0) for n in names])
     return (
         "SELECT scint, sqrt("
         f"greatest(d - transform(scint, {indexes}, {d_pedestals}, 0.), 0) * "
-        f"greatest(u - transform(scint, {indexes}, {u_pedestals}, 0.), 0)) AS v "
+        f"greatest(u - transform(scint, {indexes}, {u_pedestals}, 0.), 0)) "
+        f"* transform(scint, {indexes}, {scales}, 1.) AS v "
         f"FROM ({pair_sql(spec, names, start_ns, end_ns)})"
     )
 
