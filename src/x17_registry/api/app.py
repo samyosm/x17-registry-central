@@ -12,9 +12,11 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel
 
 from x17_registry.adapters.clickhouse import ClickHouseClient, ClickHouseError
 from x17_registry.adapters.registry import RegistryStore
+from x17_registry.application import trigger_context
 from x17_registry.application.beam import beam_context
 from x17_registry.application.channels import PMT_CHANNELS
 from x17_registry.application.identification import (
@@ -25,6 +27,7 @@ from x17_registry.application.identification import (
     excess_analyzer,
     excess_response,
     identify_excess_period,
+    lab_source_rows,
     load_identifier,
 )
 from x17_registry.config import Settings
@@ -371,6 +374,11 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
 
     identifier: list[Identifier] = []
 
+    def loaded_identifier() -> Identifier:
+        if not identifier:
+            identifier.append(load_identifier(str(settings.isotope_id_config or "")))
+        return identifier[0]
+
     def identification_input(
         from_time: datetime, to_time: datetime
     ) -> tuple[Identifier, int, int]:
@@ -378,11 +386,9 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
         end = to_time if to_time.tzinfo else to_time.replace(tzinfo=UTC)
         if start >= end:
             raise HTTPException(400, "from must be before to")
-        if not identifier:
-            identifier.append(load_identifier(str(settings.isotope_id_config or "")))
         start_ns = int(start.timestamp()) * 1_000_000_000 + start.microsecond * 1_000
         end_ns = int(end.timestamp()) * 1_000_000_000 + end.microsecond * 1_000
-        return identifier[0], start_ns, end_ns
+        return loaded_identifier(), start_ns, end_ns
 
     @app.exception_handler(IdentifierUnavailable)
     async def identifier_unavailable(
@@ -429,8 +435,25 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
                 raise HTTPException(400, "The reference must not overlap the window")
         else:
             length = max(end_ns - start_ns, 86_400 * 1_000_000_000)
+            history = trigger_context.epochs(registry.trigger_runs())
+            current = trigger_context.main_epoch(history, start_ns, end_ns)
+            # nearest period with the same trigger configuration that holds enough events
+            same = (
+                trigger_context.reference_candidates(
+                    history, current.config, start_ns, end_ns, length
+                )
+                if current
+                else iter(())
+            )
             options = (("before", start_ns - length, start_ns), ("after", end_ns, end_ns + length))
-            mode, ref_start, ref_end = next(
+            chosen = next(
+                (
+                    option
+                    for option in same
+                    if registry.count_events(option[1], option[2], timeout) >= analyzer.min_events
+                ),
+                None,
+            ) or next(
                 (
                     option
                     for option in options
@@ -438,8 +461,10 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
                 ),
                 options[0],
             )
+            mode, ref_start, ref_end = chosen
         result = identify_excess_period(
-            registry, model, (start_ns, end_ns), (ref_start, ref_end), timeout
+            registry, model, (start_ns, end_ns), (ref_start, ref_end), timeout,
+            registry.enabled_lab_sources(),
         )
         return excess_response(
             result,
@@ -448,9 +473,36 @@ def create_app(settings: Settings, store: RegistryStore | None = None) -> FastAP
                 "reference": (registry._event_at(ref_start), registry._event_at(ref_end)),
                 "durations": ((end_ns - start_ns) / 1e9, (ref_end - ref_start) / 1e9),
                 "mode": mode,
+                "trigger": trigger_context.report(
+                    trigger_context.epochs(registry.trigger_runs()),
+                    (start_ns, end_ns), (ref_start, ref_end),
+                ),
             },
             analyzer,
         )
+
+    class LabSourceSelection(BaseModel):
+        enabled: list[int]
+
+    def lab_sources_answer() -> dict[str, Any]:
+        analyzer = excess_analyzer(loaded_identifier())
+        return {"sources": lab_source_rows(analyzer, registry.enabled_lab_sources())}
+
+    @api.get("/settings/sources")
+    def lab_sources() -> Any:
+        """The lab's radioactive sources, their activity today and which are reported."""
+        return lab_sources_answer()
+
+    @api.put("/settings/sources")
+    def choose_lab_sources(selection: LabSourceSelection) -> Any:
+        """Choose the lab sources the identification may report (unsupported ones are ignored)."""
+        rows = lab_sources_answer()["sources"]
+        known = {row["id"] for row in rows}
+        unknown = sorted(set(selection.enabled) - known)
+        if unknown:
+            raise HTTPException(400, f"Unknown lab source ids: {unknown}")
+        registry.set_enabled_lab_sources(selection.enabled)
+        return lab_sources_answer()
 
     @api.get("/identification/{scintillator}")
     def identification_diagnostics(

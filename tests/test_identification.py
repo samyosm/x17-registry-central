@@ -291,9 +291,25 @@ margin_ts = 9.0
 min_events = 200
 min_plausible_activity_bq = 1000
 bad_channels = {json.dumps(BAD_FIELDS)}
-[excess.activity_bq]
-"Soft" = 1000000.0
-"Hard" = 1000000.0
+[half_life_years]
+"Soft" = 30.0
+"Hard" = 30.0
+"Fe-55" = 2.737
+[[lab_sources]]
+id = 1
+isotope = "Soft"
+activity_uci = 100.0
+reference_date = "2026-01-01"
+[[lab_sources]]
+id = 2
+isotope = "Hard"
+activity_uci = 100.0
+reference_date = "2026-01-01"
+[[lab_sources]]
+id = 3
+isotope = "Fe-55"
+activity_uci = 100.0
+reference_date = "2026-01-01"
 [excess.pedestals]
 {pedestals}
 """)
@@ -443,3 +459,96 @@ def test_excess_unavailable_without_the_section(isotope_client):
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "identifier_unavailable"
     assert "excess" in response.json()["error"]["message"]
+
+
+# --- the trigger configuration -------------------------------------------------------------------
+
+
+def trigger_entry(store, name, at_index, maj):
+    config = {"title": name, "tmod": "ormaj", "maj": maj, "thresholds": {"F0A": 4}, "masks": {}}
+    store.save(SourceRecord("trigger_history", "test", name, config, iso_of(at_index)), config)
+
+
+def test_trigger_epochs_merge_equal_configurations_and_compare():
+    from x17_registry.application import trigger_context as tc
+
+    def record(name, maj, thr, at):
+        config = {"tmod": "ormaj", "maj": maj, "thresholds": {"F0A": thr}, "title": name}
+        return {"event_time": at, "raw": config}
+
+    items = tc.epochs([
+        record("a", 1, 4, "2026-10-01T00:00:00Z"),
+        record("b", 1, 4, "2026-10-02T00:00:00Z"),  # same configuration: merged with a
+        record("c", 2, 4, "2026-10-03T00:00:00Z"),
+        record("d", 1, 4, "2026-10-04T00:00:00Z"),  # back to the first configuration
+    ])
+    assert len(items) == 3 and items[0].end_ns == items[1].start_ns
+    assert items[2].end_ns == tc.FOREVER
+    assert tc.differences(items[0].config, items[1].config) == ["majority 1 against 2"]
+    assert tc.differences(items[0].config, items[2].config) == []
+    day = 86_400 * 1_000_000_000
+    window = (items[2].start_ns + day, items[2].start_ns + 2 * day)
+    found = list(tc.reference_candidates(items, items[2].config, *window, day))
+    # nearest first: the start of the window's own period, then the first period (the same
+    # configuration again), never the middle period; the periods after come last
+    assert found[0] == ("before", items[2].start_ns, window[0])
+    assert found[1][0] == "before" and found[1][2] == items[1].start_ns
+    assert found[-1][0] == "after"
+    assert all(not (items[1].start_ns < low < items[1].end_ns) for _, low, _ in found)
+
+
+def test_excess_reference_follows_the_trigger_configuration(excess_client, store):
+    rng = np.random.default_rng(8)
+    store.save_detector_batch(
+        events(rng, 0, 4000) + events(rng, 4000, 2000, source_rate=0.1) + events(rng, 6000, 4000)
+    )
+    trigger_entry(store, "first", 0, maj=1)
+    trigger_entry(store, "second", 4000, maj=2)
+    window = {"from": iso_of(4000), "to": iso_of(6000)}
+    body = excess_client.get("/api/v1/identification", params=window).json()
+    # before the window the configuration was another one: the period after it is the reference
+    assert body["reference"]["mode"] == "after"
+    assert body["reference"]["events"] == 4000
+    assert body["trigger"]["known"] and body["trigger"]["same"] is True
+    assert body["trigger"]["window"]["majority"] == 2
+    assert not any("trigger configuration" in warning for warning in body["warnings"])
+    # a chosen reference with another configuration is used, with a warning that says what differs
+    custom = excess_client.get(
+        "/api/v1/identification", params=window | {"refFrom": iso_of(0), "refTo": iso_of(4000)}
+    ).json()
+    assert custom["trigger"]["same"] is False
+    assert custom["trigger"]["differences"] == ["majority 2 against 1"]
+    assert any("differs between the window and the reference" in w for w in custom["warnings"])
+
+
+def test_excess_without_trigger_history_still_works(excess_client, store):
+    rng = np.random.default_rng(9)
+    store.save_detector_batch(events(rng, 0, 4000) + events(rng, 4000, 2000))
+    body = excess_client.get(
+        "/api/v1/identification", params={"from": iso_of(4000), "to": iso_of(6000)}
+    ).json()
+    assert body["trigger"]["known"] is False
+    assert any("trigger history does not cover" in warning for warning in body["warnings"])
+
+
+# --- the lab sources ------------------------------------------------------------------------------
+
+
+def test_lab_sources_settings(excess_client, store):
+    rows = excess_client.get("/api/v1/settings/sources").json()["sources"]
+    by_id = {row["id"]: row for row in rows}
+    assert [by_id[i]["isotope"] for i in (1, 2, 3)] == ["Soft", "Hard", "Fe-55"]
+    assert by_id[1]["supported"] and by_id[1]["enabled"]
+    assert not by_id[3]["supported"] and not by_id[3]["enabled"] and by_id[3]["note"]
+    assert by_id[1]["activityBq"] < by_id[1]["activityUci"] * 3.7e4  # decayed
+    assert excess_client.put("/api/v1/settings/sources", json={"enabled": [9]}).status_code == 400
+    # only the chosen sources are fitted and reported
+    rng = np.random.default_rng(10)
+    store.save_detector_batch(events(rng, 0, 4000) + events(rng, 4000, 2000, source_rate=0.1))
+    params = {"from": iso_of(4000), "to": iso_of(6000)}
+    assert {s["name"] for s in excess_client.get("/api/v1/identification", params=params).json()[
+        "sources"]} == {"Soft", "Hard"}
+    changed = excess_client.put("/api/v1/settings/sources", json={"enabled": [2, 3]}).json()
+    assert [row["enabled"] for row in changed["sources"]] == [False, True, False]
+    only = excess_client.get("/api/v1/identification", params=params).json()
+    assert [s["name"] for s in only["sources"]] == ["Hard"]

@@ -195,6 +195,14 @@ class RegistryStore:
             self._set_state("checkpoint", name, "")
         return names
 
+    def enabled_lab_sources(self) -> list[int] | None:
+        """Ids of the lab sources chosen for the reports, or None when nothing was chosen yet."""
+        value = self._state("lab_sources", "enabled")
+        return None if value is None else [int(item) for item in json.loads(value)]
+
+    def set_enabled_lab_sources(self, ids: list[int]) -> None:
+        self._set_state("lab_sources", "enabled", json.dumps(sorted(set(ids))))
+
     def checkpoints(self) -> list[dict[str, str]]:
         return [
             {

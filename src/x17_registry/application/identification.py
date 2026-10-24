@@ -1,4 +1,5 @@
 from collections.abc import Mapping
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
 from x17_registry.adapters.detector_sql import PairSpec
@@ -173,14 +174,22 @@ def identify_excess_period(
     window: tuple[int, int],
     reference: tuple[int, int],
     timeout: float | None = None,
+    enabled_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Analyse a window against a reference period; the counting happens in the database."""
+    """Analyse a window against a reference period; the counting happens in the database.
+
+    enabled_ids: the lab sources to report (all when None); their activity is taken on the day
+    the window starts.
+    """
     analyzer = excess_analyzer(identifier)
     spec = excess_spec(identifier)
     counted_window = count_period(store, spec, *window, timeout)
     counted_reference = count_period(store, spec, *reference, timeout)
     try:
-        result: dict[str, Any] = analyzer.analyze(spec.groups, counted_window, counted_reference)
+        result: dict[str, Any] = analyzer.analyze(
+            spec.groups, counted_window, counted_reference, enabled_ids,
+            datetime.fromtimestamp(window[0] / 1e9, UTC).date(),
+        )
     except ValueError as error:
         if type(error).__name__ == "NotEnoughEvents":
             raise InsufficientData(str(error)) from error
@@ -199,12 +208,12 @@ def excess_response(
     (window_from, window_to), (ref_from, ref_to) = context["window"], context["reference"]
     # Rates are over the time that holds data: a reference reaching back before the first
     # reading must not look slow.
+    warnings = []
     window_seconds, ref_seconds = (
         span or nominal for span, nominal in zip(result["spans"], context["durations"], strict=True)
     )
     events = result["events"]
     window_rate, ref_rate = events["window"] / window_seconds, events["reference"] / ref_seconds
-    warnings = []
     ratio = window_rate / ref_rate if ref_rate else float("inf")
     if not 1 / RATE_RATIO < ratio < RATE_RATIO:
         warnings.append(
@@ -212,6 +221,7 @@ def excess_response(
             "reference): the trigger configuration may have changed, which makes the comparison "
             "unreliable."
         )
+    warnings.extend(context.get("trigger", {}).get("warnings", []))
     if result["verdict"].get("warning"):
         warnings.append(result["verdict"]["warning"])
     bad = [bar["bar"] for bar in result["bars"] if not bar["usable"]]
@@ -255,5 +265,39 @@ def excess_response(
             key: result["verdict"][key] for key in ("code", "source", "candidates", "centre")
         },
         "spectrum": {"edges": result["edges"], **result["spectrum"]},
+        "trigger": {
+            key: value for key, value in context.get("trigger", {"known": False}).items()
+            if key != "warnings"
+        },
         "warnings": warnings,
     }
+
+
+def lab_source_rows(
+    analyzer: Any, enabled_ids: list[int] | None, on: date | None = None
+) -> list[dict[str, Any]]:
+    """The lab sources with their activity on a day, whether they can be reported and are chosen."""
+    on = on or datetime.now(UTC).date()
+    supported = set(analyzer.supported())
+    rows = []
+    for source in analyzer.lab_sources:
+        activity = source.activity_bq(on)
+        can_report = source.isotope in supported
+        if not can_report:
+            note = "No spectrum shape for this isotope (it has not been simulated)."
+        elif activity < analyzer.min_activity_bq:
+            note = f"Only {activity:.1f} Bq today: too weak to be seen (flagged if it fits best)."
+        else:
+            note = None
+        rows.append({
+            "id": source.id,
+            "isotope": source.isotope,
+            "activityUci": source.activity_uci,
+            "referenceDate": source.reference_date.isoformat(),
+            "halfLifeYears": source.half_life_days / 365.25,
+            "activityBq": activity,
+            "supported": can_report,
+            "enabled": can_report and (enabled_ids is None or source.id in enabled_ids),
+            "note": note,
+        })
+    return rows
